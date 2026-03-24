@@ -6,11 +6,11 @@ Fleet provisioning orchestrator for dotfiles. Companion to [nit](https://github.
 
 ## Why hemma?
 
-Managing dotfiles on one machine is solved. Managing them across five is not.
+Managing dotfiles on one machine is solved. Managing them across a handful of machines — a laptop, a home server, a Raspberry Pi, maybe a VPS — is where things get manual and repetitive. You SSH in, pull the latest, restart a service, repeat for each machine. That's fleet provisioning: keeping multiple machines configured and in sync.
 
-Your dotfile manager (nit, chezmoi, etc.) handles `$HOME` beautifully — but what about `/etc/nginx/nginx.conf`? What about `/etc/iptables/rules.v4` on your router? What about bootstrapping a fresh Raspberry Pi from a blank SD card to fully configured in one command?
+Your dotfile manager ([nit](https://github.com/semikolon/nit), chezmoi, etc.) handles `$HOME` beautifully — but what about `/etc/nginx/nginx.conf` on your server? What about `/etc/iptables/rules.v4` on your router? What about bootstrapping a fresh Raspberry Pi from a blank SD card to fully configured in one command?
 
-hemma solves the gap between "my dotfiles are managed" and "my fleet is managed":
+hemma solves the gap between "my dotfiles are managed" and "my whole fleet is managed":
 
 - **Dotfile sync** across your fleet via SSH — `hemma apply server` runs `nit update` (or `chezmoi update`) on the remote machine
 - **System overlays** for files outside `$HOME` that dotfile managers don't touch — `/etc/`, `/opt/`, `/usr/local/`, `/Library/`
