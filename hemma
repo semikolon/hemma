@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# hemma — fleet provisioning orchestrator
+# Swedish: "at home" — makes every machine feel like home
+#
+# Companion to nit (github.com/semikolon/nit)
+# Works with nit or chezmoi for dotfile sync
+set -euo pipefail
+
+HEMMA_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+export HEMMA_DIR
+export HEMMA_DOTFILES="${HEMMA_DOTFILES:-$HOME/dotfiles}"
+
+exec just --justfile "$HEMMA_DIR/Justfile" --working-directory "$HEMMA_DIR" "$@"

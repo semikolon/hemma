@@ -1,0 +1,25 @@
+# hemma fleet inventory
+# Each machine's SSH host alias must match ~/.ssh/config
+#
+# Place this file at the root of your dotfiles repo as fleet.toml
+# (or set HEMMA_DOTFILES to point to the directory containing it)
+
+[machines.server]
+ssh_host = "server"        # SSH config alias for your server
+role = "server"
+critical = false
+
+[machines.laptop]
+ssh_host = "laptop"        # SSH config alias for your laptop
+role = "laptop"
+critical = false
+
+[machines.router]
+ssh_host = "router"        # SSH config alias for your router
+role = "router"
+critical = true            # Critical hosts are excluded from --all operations
+
+[machines.rpi]
+ssh_host = "rpi"           # SSH config alias for your Raspberry Pi
+role = "iot"
+critical = false
