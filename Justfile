@@ -161,13 +161,13 @@ status:
                     drift_total=0
                     r_os=$(ssh -o ConnectTimeout=5 "$host" "uname -s" 2>/dev/null || echo "unknown")
                     for base in etc opt usr Library; do
-                        [ -d "$sysdir_base/common/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/common/$base/" "$sys_merge/$base/" 2>/dev/null
+                        [ -d "$sysdir_base/common/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/common/$base/" "$sys_merge/$base/" 2>/dev/null
                         # Role overlays
                         IFS=',' read -ra _rl <<< "$role"
                         for _r in "${_rl[@]}"; do
-                            [ -d "$sysdir_base/roles/$_r/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/roles/$_r/$base/" "$sys_merge/$base/" 2>/dev/null
+                            [ -d "$sysdir_base/roles/$_r/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/roles/$_r/$base/" "$sys_merge/$base/" 2>/dev/null
                         done
-                        [ -d "$sysdir_base/$name/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/$name/$base/" "$sys_merge/$base/" 2>/dev/null
+                        [ -d "$sysdir_base/$name/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/$name/$base/" "$sys_merge/$base/" 2>/dev/null
                     done
                     # Remap Library paths for Linux targets
                     if [ "$r_os" != "Darwin" ] && [ -d "$sys_merge/Library/Fonts" ]; then
@@ -700,8 +700,9 @@ system-diff host:
         fi
     done
 
-    # Remove .hemma-perms from merge (not deployed to remote)
+    # Remove .hemma-perms and .hemma-hooks from merge (not deployed to remote)
     find "$mergedir" -name ".hemma-perms" -delete 2>/dev/null || true
+    find "$mergedir" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Remap macOS paths to Linux equivalents on non-Darwin hosts
     remote_os=$(ssh -o ConnectTimeout=5 "$target_host" "uname -s" 2>/dev/null || echo "unknown")
@@ -748,6 +749,72 @@ system-diff host:
         printf "{{green}}No content changes needed.{{reset}}\n"
     else
         printf "\n{{bold}}%d file(s) with content changes.{{reset}}\n" "$total_changed"
+
+        # Preview which hooks would fire
+        # Collect changed files from dry-run (same pattern as system-apply)
+        diff_changed_files=""
+        for base in $deploy_bases; do
+            if [ -d "$mergedir/$base" ]; then
+                diff_raw=$(rsync -e "ssh" --dry-run --itemize-changes --checksum -rltD \
+                    "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
+                diff_base_changed=$(echo "$diff_raw" | grep -E '^[<>][^ ]*[cs]' | awk '{print $2}' || true)
+                if [ -n "$diff_base_changed" ]; then
+                    while IFS= read -r cf; do
+                        diff_changed_files="${diff_changed_files}${base}/${cf}"$'\n'
+                    done <<< "$diff_base_changed"
+                fi
+            fi
+        done
+        # Collect hooks from all overlay layers
+        diff_hooks_files=()
+        for base in $source_bases; do
+            if [ -f "$sysdir/common/$base/.hemma-hooks" ]; then
+                diff_hooks_files+=("$base:$sysdir/common/$base/.hemma-hooks")
+            fi
+            IFS=',' read -ra _dhrl <<< "$host_role"
+            for _dhr in "${_dhrl[@]}"; do
+                if [ -f "$sysdir/roles/$_dhr/$base/.hemma-hooks" ]; then
+                    diff_hooks_files+=("$base:$sysdir/roles/$_dhr/$base/.hemma-hooks")
+                fi
+            done
+            if [ -f "$sysdir/$host_name/$base/.hemma-hooks" ]; then
+                diff_hooks_files+=("$base:$sysdir/$host_name/$base/.hemma-hooks")
+            fi
+        done
+        if [ -n "$diff_changed_files" ] && [ "${#diff_hooks_files[@]}" -gt 0 ]; then
+            hooks_preview=""
+            declare -A preview_seen
+            for entry in "${diff_hooks_files[@]}"; do
+                hook_base="${entry%%:*}"
+                hook_file="${entry#*:}"
+                [ -f "$hook_file" ] || continue
+                while IFS=: read -r glob cmd || [ -n "$glob" ]; do
+                    [[ "$glob" =~ ^[[:space:]]*# ]] && continue
+                    [[ -z "${glob// /}" ]] && continue
+                    glob=$(echo "$glob" | xargs)
+                    cmd=$(echo "$cmd" | xargs)
+                    [ -z "$cmd" ] && continue
+                    [ "${preview_seen[$cmd]+_}" ] && continue
+                    while IFS= read -r changed; do
+                        [ -z "$changed" ] && continue
+                        changed_base="${changed%%/*}"
+                        changed_rel="${changed#*/}"
+                        [ "$changed_base" != "$hook_base" ] && continue
+                        case "$changed_rel" in
+                            $glob)
+                                hooks_preview="${hooks_preview}  ${hook_base}/${glob} → ${cmd}\n"
+                                preview_seen[$cmd]=1
+                                break
+                                ;;
+                        esac
+                    done <<< "$diff_changed_files"
+                done < "$hook_file"
+            done
+            if [ -n "$hooks_preview" ]; then
+                printf "\n{{bold}}Hooks that would fire:{{reset}}\n"
+                printf "%b" "$hooks_preview"
+            fi
+        fi
     fi
 
 # Deploy system config overlay to a host
@@ -900,13 +967,37 @@ system-apply host *flags:
         if [ -f "$sysdir/common/$base/.hemma-perms" ]; then
             perms_files+=("$base:$sysdir/common/$base/.hemma-perms")
         fi
+        IFS=',' read -ra _prl <<< "$host_role"
+        for _pr in "${_prl[@]}"; do
+            if [ -f "$sysdir/roles/$_pr/$base/.hemma-perms" ]; then
+                perms_files+=("$base:$sysdir/roles/$_pr/$base/.hemma-perms")
+            fi
+        done
         if [ -f "$sysdir/$host_name/$base/.hemma-perms" ]; then
             perms_files+=("$base:$sysdir/$host_name/$base/.hemma-perms")
         fi
     done
 
-    # Remove .hemma-perms from merge (not deployed to remote)
+    # Capture hooks manifests from all overlay layers (common → roles → host-specific)
+    hooks_files=()
+    for base in $source_bases; do
+        if [ -f "$sysdir/common/$base/.hemma-hooks" ]; then
+            hooks_files+=("$base:$sysdir/common/$base/.hemma-hooks")
+        fi
+        IFS=',' read -ra _hrl <<< "$host_role"
+        for _hr in "${_hrl[@]}"; do
+            if [ -f "$sysdir/roles/$_hr/$base/.hemma-hooks" ]; then
+                hooks_files+=("$base:$sysdir/roles/$_hr/$base/.hemma-hooks")
+            fi
+        done
+        if [ -f "$sysdir/$host_name/$base/.hemma-hooks" ]; then
+            hooks_files+=("$base:$sysdir/$host_name/$base/.hemma-hooks")
+        fi
+    done
+
+    # Remove .hemma-perms and .hemma-hooks from merge (not deployed to remote)
     find "$mergedir" -name ".hemma-perms" -delete 2>/dev/null || true
+    find "$mergedir" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Remap macOS paths to Linux equivalents on non-Darwin hosts
     remote_os=$(ssh -o ConnectTimeout=5 "$target_host" "uname -s" 2>/dev/null || echo "unknown")
@@ -1047,11 +1138,20 @@ system-apply host *flags:
     fi
 
     # Deploy via rsync with sudo on remote per deploy base
+    # Capture itemize-changes to detect which files had actual content changes (for hooks)
     printf "{{cyan}}hemma{{reset}}: deploying system configs to %s...\n" "$host_name"
+    all_changed_files=""
     for base in $deploy_bases; do
         if [ -d "$mergedir/$base" ]; then
-            rsync -e "ssh" --rsync-path="sudo rsync" -rltD \
-                "$mergedir/$base/" "$target_host:/$base/"
+            deploy_output=$(rsync -e "ssh" --rsync-path="sudo rsync" --itemize-changes -rltD \
+                "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
+            # Extract files with actual content changes (c=checksum, s=size)
+            base_changed=$(echo "$deploy_output" | grep -E '^[<>][^ ]*[cs]' | awk '{print $2}' || true)
+            if [ -n "$base_changed" ]; then
+                while IFS= read -r cf; do
+                    all_changed_files="${all_changed_files}${base}/${cf}"$'\n'
+                done <<< "$base_changed"
+            fi
         fi
     done
 
@@ -1076,6 +1176,58 @@ system-apply host *flags:
             done < "$perm_file"
         fi
     done
+
+    # Run post-deploy hooks for files with actual content changes
+    if [ -n "$all_changed_files" ] && [ "${#hooks_files[@]}" -gt 0 ]; then
+        hooks_run=0
+        # Track which commands already ran (each hook command runs at most once)
+        declare -A hooks_executed
+        for entry in "${hooks_files[@]}"; do
+            hook_base="${entry%%:*}"
+            hook_file="${entry#*:}"
+            [ -f "$hook_file" ] || continue
+            while IFS=: read -r glob cmd || [ -n "$glob" ]; do
+                # Skip comments and blank lines
+                [[ "$glob" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "${glob// /}" ]] && continue
+                glob=$(echo "$glob" | xargs)  # trim whitespace
+                cmd=$(echo "$cmd" | xargs)
+                [ -z "$cmd" ] && continue
+                # Skip if this exact command already ran
+                [ "${hooks_executed[$cmd]+_}" ] && continue
+                # Check if any changed file matches this glob
+                matched=false
+                while IFS= read -r changed; do
+                    [ -z "$changed" ] && continue
+                    # changed is "base/path/to/file", glob is relative to base
+                    changed_base="${changed%%/*}"
+                    changed_rel="${changed#*/}"
+                    # Only match files in the same base as the hook
+                    [ "$changed_base" != "$hook_base" ] && continue
+                    # Use case for glob matching (bash extglob not needed for simple globs)
+                    case "$changed_rel" in
+                        $glob)
+                            matched=true
+                            break
+                            ;;
+                    esac
+                done <<< "$all_changed_files"
+                if [ "$matched" = "true" ]; then
+                    printf "  {{cyan}}hook{{reset}}: %s → %s\n" "$hook_base/$glob" "$cmd"
+                    if ssh "$target_host" "$cmd" 2>&1; then
+                        hooks_run=$((hooks_run + 1))
+                    else
+                        printf "  {{yellow}}WARNING{{reset}}: hook failed: %s\n" "$cmd"
+                        hooks_run=$((hooks_run + 1))
+                    fi
+                    hooks_executed[$cmd]=1
+                fi
+            done < "$hook_file"
+        done
+        if [ "$hooks_run" -gt 0 ]; then
+            printf "{{cyan}}hemma{{reset}}: %d hook(s) executed.\n" "$hooks_run"
+        fi
+    fi
 
     # Auto-commit via etckeeper if available
     ssh "$target_host" "command -v etckeeper >/dev/null 2>&1 && sudo etckeeper commit 'hemma system-apply' 2>/dev/null || true"
@@ -1212,6 +1364,7 @@ system-pull host *flags:
         fi
     done
     find "$merge_src" -name ".hemma-perms" -delete 2>/dev/null || true
+    find "$merge_src" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Map merged files back to their overlay source paths
     has_files=false
