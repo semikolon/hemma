@@ -1420,7 +1420,7 @@ system-pull host *flags:
 
 # Prepare RPi SD card boot partition for headless first boot
 # Writes firstrun.sh (NetworkManager WiFi, user, hostname, SSH) + cmdline.txt trigger
-# Usage: just prepare-sd /Volumes/bootfs turing Sarpetorp <wifi_password> [user]
+# Usage: just prepare-sd /Volumes/bootfs myrpi MyWiFi <wifi_password> [user]
 prepare-sd bootfs hostname wifi_ssid wifi_password user="pi":
     #!/usr/bin/env bash
     set -euo pipefail

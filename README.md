@@ -349,9 +349,9 @@ hemma gracefully enhances its output when these are available:
 
 | Tool | Used for |
 |------|----------|
-| [rsync-humanize](https://github.com/semikolon/nit) | Human-readable diff output in system-diff/apply |
+| `rsync-humanize` | Human-readable diff output in system-diff/apply |
 | [diff-so-fancy](https://github.com/so-fancy/diff-so-fancy) | Colorized diffs in system-pull |
-| [hemma-diff-triage](https://github.com/semikolon/nit) | LLM-powered diff categorization |
+| `hemma-diff-triage` | LLM-powered diff categorization (Fabric + OpenAI) |
 | [etckeeper](https://etckeeper.branchable.com/) | Discovery of recently changed /etc files |
 | [gh](https://cli.github.com/) | GitHub key registration during bootstrap |
 
