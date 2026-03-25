@@ -116,14 +116,16 @@ If you also use [nit](https://github.com/semikolon/nit), the same `fleet.toml` i
 
 ## Dotfile Sync
 
-hemma wraps your dotfile manager for remote sync. It auto-detects nit or chezmoi on each machine:
+Your dotfiles live in a git repo. Each machine has a copy. When you change a config on your laptop and push, the other machines need to pull the changes and apply them — render templates, decrypt secrets, run provisioning scripts. That's what `nit update` (or `chezmoi update`) does on each machine.
+
+hemma automates the "SSH into each machine and run the sync" part:
 
 ```bash
 hemma apply server    # SSH to server, run nit update (or chezmoi update)
 hemma apply-all       # Do it in parallel for all non-critical hosts
 ```
 
-When a host has system overlays, `hemma apply` automatically chains `system-apply` after the dotfile sync. One command does everything.
+hemma auto-detects whether the remote machine has nit or chezmoi installed, and calls the right command. When a host also has system overlays, `hemma apply` automatically chains `system-apply` after the dotfile sync. One command does everything.
 
 ### Critical machine protection
 
@@ -187,7 +189,7 @@ Overlays merge in this order — last wins:
 2. `roles/<role>/` — role-specific configs (a machine can have multiple roles)
 3. `<hostname>/` — machine-specific overrides (highest priority)
 
-If the same file exists in `common/etc/foo.conf` and `myserver/etc/foo.conf`, the machine-specific version wins.
+For example: you put a shared SSH hardening config in `common/etc/ssh/sshd_config.d/hardening.conf`. All machines get it. But your router needs an extra setting — create `roles/router/etc/ssh/sshd_config.d/hardening.conf` with the router version. Routers get the role-specific version; everything else gets the common one.
 
 ### Permission manifests
 
@@ -262,6 +264,21 @@ In interactive mode, you can overwrite, skip, or pull each file individually.
 - **etckeeper changes** — if the remote uses [etckeeper](https://etckeeper.branchable.com/), hemma shows recently changed `/etc` files not in your overlay
 
 This helps you decide what to bring under management.
+
+### Post-deploy hooks
+
+When hemma deploys a config file, the service reading that file often needs to be restarted or reloaded. Place a `.hemma-hooks` file alongside your configs to automate this:
+
+```
+# system/roles/server/etc/.hemma-hooks — format: glob:command
+nginx/*:sudo systemctl reload nginx
+iptables/*:sudo iptables-restore < /etc/iptables/rules.v4
+systemd/system/*.service:sudo systemctl daemon-reload
+```
+
+Hooks only fire for files with **actual content changes** — not timestamp-only touches. Each command runs at most once per deploy, even if multiple files match the same glob. Failed hooks warn but don't abort the deploy.
+
+Hooks are collected from all overlay layers (common → roles → host-specific), same as configs. `hemma system-diff` previews which hooks would fire before you deploy.
 
 ### LLM-powered diff triage (optional)
 
