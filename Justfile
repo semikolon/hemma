@@ -1468,7 +1468,59 @@ system-pull host *flags:
         while read -r uf; do
             printf "    + %s\n" "$uf"
         done < "$unmanaged_files"
-        printf "  {{cyan}}tip{{reset}}      To add: scp %s:<path> %s/%s/<relative-path>\n" "$target_host" "$sysdir" "$host_name"
+
+        # Interactive add: offer to pull discovered files into the host overlay
+        if [ "$auto_yes" = "false" ]; then
+            printf "\n  Add discovered files to %s overlay? [y/N/s=select] " "$host_name"
+            read -r add_action
+        else
+            add_action="n"
+        fi
+
+        if [ "$add_action" = "y" ] || [ "$add_action" = "Y" ]; then
+            # Add all discovered files
+            added=0
+            while read -r uf; do
+                [ -z "$uf" ] && continue
+                # Determine which base path this belongs to (etc, usr, opt, Library)
+                base=$(echo "$uf" | cut -d'/' -f2)
+                relpath=$(echo "$uf" | sed "s|^/$base/||")
+                dest="$sysdir/$host_name/$base/$relpath"
+                mkdir -p "$(dirname "$dest")"
+                if scp -q "$target_host:$uf" "$dest" 2>/dev/null; then
+                    added=$((added + 1))
+                    printf "  {{green}}added{{reset}}  %s → %s/%s/\n" "$uf" "$host_name" "$base"
+                else
+                    printf "  {{red}}failed{{reset}} %s\n" "$uf"
+                fi
+            done < "$unmanaged_files"
+            if [ "$added" -gt 0 ]; then
+                printf "\n  {{green}}%d file(s) added to overlay.{{reset}}\n" "$added"
+            fi
+        elif [ "$add_action" = "s" ] || [ "$add_action" = "S" ]; then
+            # Selective add: prompt for each file
+            added=0
+            while read -r uf; do
+                [ -z "$uf" ] && continue
+                printf "  Add %s? [y/N] " "$uf"
+                read -r file_action
+                if [ "$file_action" = "y" ] || [ "$file_action" = "Y" ]; then
+                    base=$(echo "$uf" | cut -d'/' -f2)
+                    relpath=$(echo "$uf" | sed "s|^/$base/||")
+                    dest="$sysdir/$host_name/$base/$relpath"
+                    mkdir -p "$(dirname "$dest")"
+                    if scp -q "$target_host:$uf" "$dest" 2>/dev/null; then
+                        added=$((added + 1))
+                        printf "  {{green}}added{{reset}}  %s\n" "$uf"
+                    else
+                        printf "  {{red}}failed{{reset}} %s\n" "$uf"
+                    fi
+                fi
+            done < "$unmanaged_files"
+            if [ "$added" -gt 0 ]; then
+                printf "\n  {{green}}%d file(s) added to overlay.{{reset}}\n" "$added"
+            fi
+        fi
     fi
 
     rm -f "$unmanaged_files" "$managed_dirs"
