@@ -2,8 +2,8 @@
 # hemma — fleet provisioning orchestrator
 # Swedish: "at home" — makes every machine feel like home
 #
-# Companion to nit (github.com/semikolon/nit)
-# Works with nit or chezmoi for dotfile sync
+# Companion to nit (github.com/semikolon/nit), which must run on every machine.
+# Thin wrapper that invokes just with the hemma Justfile.
 set -euo pipefail
 
 HEMMA_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
