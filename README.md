@@ -8,11 +8,11 @@ Fleet provisioning orchestrator for dotfiles. Companion to [nit](https://github.
 
 Managing dotfiles on one machine is solved. Managing them across a handful of machines — a laptop, a home server, a Raspberry Pi, maybe a VPS — is where things get manual and repetitive. You SSH in, pull the latest, restart a service, repeat for each machine. That's fleet provisioning: keeping multiple machines configured and in sync.
 
-Your dotfile manager ([nit](https://github.com/semikolon/nit), chezmoi, etc.) handles `$HOME` beautifully — but what about `/etc/nginx/nginx.conf` on your server? What about `/etc/iptables/rules.v4` on your router? What about bootstrapping a fresh Raspberry Pi from a blank SD card to fully configured in one command?
+Your dotfile manager ([nit](https://github.com/semikolon/nit)) handles `$HOME` beautifully — but what about `/etc/nginx/nginx.conf` on your server? What about `/etc/iptables/rules.v4` on your router? What about bootstrapping a fresh Raspberry Pi from a blank SD card to fully configured in one command?
 
 hemma solves the gap between "my dotfiles are managed" and "my whole fleet is managed":
 
-- **Dotfile sync** across your fleet via SSH — `hemma apply server` runs `nit update` (or `chezmoi update`) on the remote machine
+- **Dotfile sync** across your fleet via SSH — `hemma apply server` runs `nit update` on the remote machine
 - **System overlays** for files outside `$HOME` that dotfile managers don't touch — `/etc/`, `/opt/`, `/usr/local/`, `/Library/`
 - **Bootstrap** new machines from zero to fully configured in one command
 - **Drift detection** tells you when remote configs were changed outside hemma
@@ -26,26 +26,22 @@ hemma solves the gap between "my dotfiles are managed" and "my whole fleet is ma
 - [just](https://github.com/casey/just) (command runner)
 - Python 3.11+ (for fleet.toml parsing)
 - rsync, ssh, age (standard tools)
-- A dotfile manager: [nit](https://github.com/semikolon/nit) (preferred) or [chezmoi](https://www.chezmoi.io/)
+- [nit](https://github.com/semikolon/nit) on every machine (hemma reads its sync records and runs its updates)
 
 ### Install
 
 ```bash
-# Clone into your dotfiles repo (or anywhere — it's self-contained)
-git clone https://github.com/semikolon/hemma.git ~/dotfiles/hemma
-
-# Or install standalone
-git clone https://github.com/semikolon/hemma.git ~/hemma
-
-# Add to PATH
-export PATH="$HOME/dotfiles/hemma:$PATH"   # or wherever you cloned it
+git clone https://github.com/semikolon/hemma.git ~/Projects/hemma
+ln -s ~/Projects/hemma/hemma ~/.local/bin/hemma   # any folder on your PATH
 ```
+
+Keep hemma outside your dotfiles repo. hemma is the tool; your dotfiles repo holds the data it works on (`fleet.toml`, `system/`, `bootstrap.sh`).
 
 ### Configure
 
 1. Create `fleet.toml` at the root of your dotfiles repo (see [fleet.toml](#fleettoml) below)
 2. Ensure each machine has an SSH config entry matching the `ssh_host` in fleet.toml
-3. Set environment variables if your dotfiles aren't at `~/dotfiles`:
+3. Set this environment variable if your dotfiles are not at `~/dotfiles`:
    ```bash
    export HEMMA_DOTFILES="$HOME/my-dotfiles"
    ```
@@ -62,11 +58,11 @@ hemma system-diff server  # Preview system config changes
 
 | Command | Description |
 |---------|-------------|
-| `hemma status` | Show fleet status — sync state, git hash, uptime, drift |
+| `hemma status` | Show fleet status — last nit sync, git hash, uptime |
 | `hemma apply <host>` | Sync dotfiles + system overlay to a host |
 | `hemma apply-all` | Sync to all non-critical hosts (parallel) |
 | `hemma apply-all --force` | Include critical hosts |
-| `hemma update` | Update the local machine (pull + sync) |
+| `hemma update` | Update the local machine (`nit update`) |
 | `hemma system-diff <host>` | Preview system config changes (dry-run) |
 | `hemma system-apply <host>` | Deploy system config overlay to a host |
 | `hemma system-apply-all` | Deploy system configs fleet-wide |
@@ -87,45 +83,45 @@ The fleet inventory. Place this at the root of your dotfiles repo. hemma reads i
 
 [machines.server]
 ssh_host = "server"        # SSH config alias
-role = "server"
+role = ["server"]
 critical = false
 
 [machines.laptop]
 ssh_host = "laptop"
-role = "laptop"
+role = ["dev"]
 critical = false
 
 [machines.router]
 ssh_host = "router"
-role = "router"
+role = ["router"]
 critical = true            # Excluded from --all operations
 
 [machines.rpi]
 ssh_host = "rpi"
-role = "iot"
+role = ["iot"]
 critical = false
 ```
 
 **Fields:**
 
 - `ssh_host` — The SSH host alias from `~/.ssh/config`. hemma uses this for all SSH/rsync operations.
-- `role` — Comma-separated roles. Used for role-based system overlays (e.g., `"server,router"`).
+- `role` — A list of roles, used for role-based system overlays (e.g., `["server", "router"]`). A comma-separated string also works.
 - `critical` — When `true`, the host is excluded from `--all` operations and requires explicit confirmation before changes. Use for routers, gateways, and infrastructure where a bad deploy means network outage.
 
-If you also use [nit](https://github.com/semikolon/nit), the same `fleet.toml` is shared — one file, both tools.
+[nit](https://github.com/semikolon/nit) reads the same `fleet.toml` — one file, both tools. hemma stops with an error if the file is missing; it never falls back to another fleet file.
 
 ## Dotfile Sync
 
-Your dotfiles live in a git repo. Each machine has a copy. When you change a config on your laptop and push, the other machines need to pull the changes and apply them — render templates, decrypt secrets, run provisioning scripts. That's what `nit update` (or `chezmoi update`) does on each machine.
+Your dotfiles live in a git repo. Each machine has a copy. When you change a config on your laptop and push, the other machines need to pull the changes and apply them — render templates, decrypt secrets, run provisioning scripts. That's what `nit update` does on each machine.
 
 hemma automates the "SSH into each machine and run the sync" part:
 
 ```bash
-hemma apply server    # SSH to server, run nit update (or chezmoi update)
+hemma apply server    # SSH to server, run nit update
 hemma apply-all       # Do it in parallel for all non-critical hosts
 ```
 
-hemma auto-detects whether the remote machine has nit or chezmoi installed, and calls the right command. When a host also has system overlays, `hemma apply` automatically chains `system-apply` after the dotfile sync. One command does everything.
+If nit stops the update because a tracked file was edited on that machine, hemma reports it and stops too: nothing local is overwritten. When a host also has system overlays, `hemma apply` automatically chains `system-apply` after the dotfile sync. One command does everything.
 
 ### Critical machine protection
 
@@ -205,7 +201,7 @@ hemma applies these permissions via `sudo chown`/`chmod` on the remote after rsy
 
 ### Secrets
 
-Sensitive files (passwords, certificates, API keys) go in `system/secrets/<hostname>/` as age-encrypted `.age` files. hemma decrypts them at deploy time using your local age key (from `~/.config/nit/key.txt` or `~/.config/chezmoi/key.txt`).
+Sensitive files (passwords, certificates, API keys) go in `system/secrets/<hostname>/` as age-encrypted `.age` files. hemma decrypts them at deploy time using your local age key, `~/.config/nit/age-key.txt`.
 
 ```bash
 # Encrypt a secret for deployment
@@ -270,13 +266,24 @@ This helps you decide what to bring under management.
 When hemma deploys a config file, the service reading that file often needs to be restarted or reloaded. Place a `.hemma-hooks` file alongside your configs to automate this:
 
 ```
-# system/roles/server/etc/.hemma-hooks — format: glob:command
-nginx/*:sudo systemctl reload nginx
-iptables/*:sudo iptables-restore < /etc/iptables/rules.v4
-systemd/system/*.service:sudo systemctl daemon-reload
+# system/roles/server/etc/.hemma-hooks — format: glob!class:command
+systemd/system/*.service!safe:sudo systemctl daemon-reload
+nginx/*!disruptive:sudo systemctl reload nginx
+iptables/*!risky:sudo iptables-restore < /etc/iptables/rules.v4
 ```
 
-Hooks only fire for files with **actual content changes** — not timestamp-only touches. Each command runs at most once per deploy, even if multiple files match the same glob. Failed hooks warn but don't abort the deploy.
+Each hook has a class that says how much it may disturb:
+
+| Class | Runs by default? | Meaning |
+|-------|------------------|---------|
+| `safe` | yes | idempotent, no service interruption |
+| `disruptive` | yes | a brief restart, no state lost |
+| `risky` | no, opt in with `--run-risky-hooks` | can cascade or is hard to reverse (network, Docker) |
+| *(none)* | no, opt in with `--run-untagged-hooks` | not classified yet |
+
+`--no-disruptive-hooks` runs only the safe ones, `--no-hooks` runs none, and `--dry-run-hooks` lists what would run.
+
+Hooks only fire for files with **actual content changes** — not timestamp-only touches. Each command runs at most once per deploy, even if multiple files match the same glob. Failed hooks warn but don't abort the deploy. The glob is a shell `case` pattern, so `*` also matches `/`.
 
 Hooks are collected from all overlay layers (common → roles → host-specific), same as configs. `hemma system-diff` previews which hooks would fire before you deploy.
 
@@ -298,15 +305,15 @@ This runs 7 steps:
 2. **Run bootstrap.sh** — installs dependencies, generates age + SSH keys, sets zsh
 3. **Register SSH key** on GitHub (via `gh`)
 4. **Register deploy key** for your dotfiles repo
-5. **Add age recipient** — inserts the machine's age public key into your config template, re-encrypts all secrets
-6. **Initialize dotfile manager** — runs `nit init --apply` (or `chezmoi init --apply`) on the remote
+5. **Add age recipient** — `nit fleet-add-recipient` adds the machine's age key to the `tier-all` secrets tier, and `nit rekey` re-encrypts the secrets (other tiers are listed for you to add by hand)
+6. **Install nit** — installs nit on the remote and runs `nit bootstrap` against your dotfiles repo
 7. **Apply system overlay** — deploys system configs if any exist for this host
 
 After bootstrap, the machine is part of your fleet — `hemma apply` and `hemma status` work immediately.
 
 ### Environment variables for bootstrap
 
-Bootstrap needs to know your dotfiles repo:
+Bootstrap needs to know your dotfiles repo. By default it reads the URL from your local nit (`nit remote get-url origin`). To set it yourself:
 
 ```bash
 export HEMMA_DOTFILES_REPO="youruser/dotfiles"     # GitHub owner/repo
@@ -315,7 +322,7 @@ export HEMMA_DOTFILES_SSH="git@github.com:youruser/dotfiles.git"
 
 ### bootstrap.sh
 
-hemma looks for `bootstrap.sh` in your dotfiles repo root, then in the hemma directory. This script runs on the remote machine and should install basic dependencies (git, age, zsh, etc.) and generate SSH + age keys. Write your own — it's specific to your setup.
+hemma looks for `bootstrap.sh` in your dotfiles repo root. This script runs on the remote machine and should install basic dependencies (git, age, zsh, etc.) and generate SSH + age keys. Write your own — it's specific to your setup.
 
 ## RPi Headless Provisioning
 
@@ -343,12 +350,10 @@ hemma bootstrap myrpi 192.168.1.50 pi
 
 hemma and [nit](https://github.com/semikolon/nit) share `fleet.toml` — one file defines your fleet for both tools. hemma handles orchestration and system overlays; nit handles the dotfiles themselves.
 
-When nit is installed, hemma automatically uses it:
+hemma requires nit on every machine:
 - `hemma update` calls `nit update`
 - `hemma apply <host>` runs `nit update` on the remote
-- `hemma status` checks `nit status` for drift counts
-
-Without nit, hemma falls back to chezmoi with the same semantics.
+- `hemma status` reads each machine's `~/.local/share/nit/last-sync.json`, so it shows whether the last nightly sync succeeded, stopped on an edited file, or failed
 
 ## Configuration
 
@@ -357,8 +362,8 @@ Without nit, hemma falls back to chezmoi with the same semantics.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HEMMA_DOTFILES` | `~/dotfiles` | Path to your dotfiles repo |
-| `HEMMA_DOTFILES_REPO` | *(required for bootstrap)* | GitHub owner/repo (e.g., `youruser/dotfiles`) |
-| `HEMMA_DOTFILES_SSH` | *(required for bootstrap)* | SSH clone URL for dotfiles |
+| `HEMMA_DOTFILES_REPO` | *(from nit's remote)* | GitHub owner/repo (e.g., `youruser/dotfiles`), for bootstrap |
+| `HEMMA_DOTFILES_SSH` | *(from nit's remote)* | SSH clone URL for dotfiles, for bootstrap |
 
 ### Optional tools
 
@@ -387,7 +392,7 @@ just --justfile Justfile apply server
   ↓
 parse-fleet.py → reads fleet.toml → outputs machine list
   ↓
-SSH to server → nit update (or chezmoi update)
+SSH to server → nit update
   ↓
 If system overlay exists → rsync with sudo
 ```

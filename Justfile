@@ -1,12 +1,9 @@
 # hemma — fleet provisioning orchestrator
 # Swedish: "at home" — makes every machine feel like home
 #
-# Companion to nit (github.com/semikolon/nit)
-# Works with nit or chezmoi for dotfile sync
-#
 # Usage:
 #   just status                  Show fleet status
-#   just apply <host>            Apply dotfile sync + system overlay on a host
+#   just apply <host>            Run nit update + system overlay on a host
 #   just apply-all               Apply to all non-critical hosts
 #   just apply-all --force       Apply to ALL hosts including critical
 #   just system-diff <host>      Preview system config changes (dry-run)
@@ -16,7 +13,7 @@
 #   just system-pull-all         Pull from all non-critical hosts
 #   just bootstrap <host>        Bootstrap a new machine (SSH-reachable)
 #   just prepare-sd <bootfs> ... Prepare RPi SD card for headless first boot
-#   just update                  Update local machine (dotfile sync, immediate)
+#   just update                  Update local machine (nit update, immediate)
 #   just run <host> <cmd>        Run arbitrary command on a host
 #   just run-all <cmd>           Run command on all non-critical hosts
 #   just ssh <host>              Open SSH session to a host
@@ -26,17 +23,24 @@
 #   2. just prepare-sd /Volumes/bootfs <hostname> <ssid> <wifi_pw> [user]
 #   3. Insert SD card, power on — first boot configures WiFi/SSH/user, reboots
 #   4. just bootstrap <hostname> <ip> <user>
-#   5. Dotfile manager run_onchange scripts install Docker, HA, Node-RED, etc.
+#   5. nit triggers install Docker, HA, Node-RED, etc.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# Configurable paths — override via environment variables
+# Prefer Homebrew rsync (3.x) to avoid protocol mismatch with Linux remotes.
+# Apple's rsync 2.6.9 (protocol 29) causes false checksum divergence against 3.2+ (protocol 31).
+# /opt/homebrew/bin = Apple Silicon, /usr/local/bin = Intel. Harmless on Linux (dirs don't exist).
+export PATH := "/opt/homebrew/bin:/usr/local/bin:" + env_var("PATH")
+
+# Where the fleet's data lives (fleet.toml, system/, bootstrap.sh) and where
+# hemma itself lives. The `hemma` wrapper exports both; run through `just`
+# directly, the defaults apply.
 dotfiles_dir := env("HEMMA_DOTFILES", home_directory() + "/dotfiles")
 hemma_dir := env("HEMMA_DIR", justfile_directory())
 
 # Fleet inventory — parsed from fleet.toml (single source of truth)
 # Format: name:ssh_host:role:critical
-fleet := `python3 "$HEMMA_DIR/parse-fleet.py"`
+fleet := `python3 "${HEMMA_DIR:-.}/parse-fleet.py"`
 
 # Colors
 green := "\\033[32m"
@@ -46,75 +50,64 @@ cyan := "\\033[36m"
 bold := "\\033[1m"
 reset := "\\033[0m"
 
-# System overlay directory (relative to dotfiles repo root)
+# System overlay directory, inside the dotfiles repo
 system_dir := dotfiles_dir + "/system"
 
 # Default recipe — show help
 default:
     @just --list --unsorted
 
-# Detect the sync command (nit or chezmoi)
-[private]
-sync-cmd:
-    #!/usr/bin/env bash
-    if command -v nit >/dev/null 2>&1; then
-        echo "nit update"
-    elif command -v chezmoi >/dev/null 2>&1; then
-        echo "chezmoi update --no-tty"
-    else
-        echo "echo 'ERROR: neither nit nor chezmoi found'" >&2
-        exit 1
-    fi
-
-# Update local machine (git pull + dotfile sync, skips idle check)
+# Update local machine (git pull + nit apply via `nit update`)
 update:
     #!/usr/bin/env bash
     set -euo pipefail
     printf "{{bold}}{{cyan}}hemma{{reset}} — updating local machine\n\n"
-
-    # Try nit first, then chezmoi with its idle wrapper, then plain chezmoi
-    if command -v nit >/dev/null 2>&1; then
-        nit update
-    elif [ -x "$HOME/.local/bin/chezmoi-update-if-idle" ]; then
-        "$HOME/.local/bin/chezmoi-update-if-idle" --force
-    else
-        chezmoi_bin=$(command -v chezmoi || echo "$HOME/.local/bin/chezmoi")
-        "$chezmoi_bin" update --no-tty
+    nit_bin=$(command -v nit || echo "$HOME/.local/bin/nit")
+    if [ ! -x "$nit_bin" ]; then
+        nit_bin="$HOME/.cargo/bin/nit"
     fi
+    "$nit_bin" update
     printf "\n{{green}}Done{{reset}}: local machine updated.\n"
 
-# Show fleet status (sync state, git hash, uptime)
+# Show fleet status (nit sync state, git hash, uptime, system overlay drift)
+# Pulls ~/.local/share/nit/last-sync.json from each machine for sync health.
 status:
     #!/usr/bin/env bash
     set -euo pipefail
     printf "{{bold}}{{cyan}}hemma{{reset}} — fleet status\n\n"
-    printf "%-12s %-10s %-8s %-12s %-20s %-16s %s\n" "MACHINE" "ROLE" "STATUS" "GIT HASH" "UPTIME" "SYNC" "SYSTEM"
+    printf "%-12s %-10s %-8s %-12s %-20s %-20s %s\n" "MACHINE" "ROLE" "STATUS" "HEAD" "UPTIME" "LAST SYNC" "SYS OVERLAY"
 
-    # Detect local sync tool
-    sync_tool="unknown"
-    if command -v nit >/dev/null 2>&1; then
-        sync_tool="nit"
-    elif command -v chezmoi >/dev/null 2>&1; then
-        sync_tool="chezmoi"
-    fi
+    # Helper: parse nit last-sync.json (remote or local). Emits "<result> <drift_n>".
+    # Empty output = no status file (never synced under new scheme).
+    read_sync() {
+        local json="$1"
+        [ -z "$json" ] && { echo ""; return; }
+        local result drift_n
+        result=$(echo "$json" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(d.get("result","?"))' 2>/dev/null || echo "?")
+        drift_n=$(echo "$json" | python3 -c 'import sys, json; d=json.load(sys.stdin); print(len(d.get("drift_files",[])))' 2>/dev/null || echo "0")
+        echo "$result $drift_n"
+    }
 
     # Local machine first
-    local_hash=$(git -C "{{dotfiles_dir}}" rev-parse --short HEAD 2>/dev/null || echo "n/a")
+    local_hash=$(git --git-dir=$HOME/.local/share/nit/repo.git rev-parse --short HEAD 2>/dev/null || echo "n/a")
     local_uptime=$(uptime | sed 's/.*up //' | sed 's/,.*//')
-    local_drift="0"
-    if [ "$sync_tool" = "nit" ]; then
-        local_drift=$(nit status --count 2>/dev/null || echo "n/a")
-    elif [ "$sync_tool" = "chezmoi" ]; then
-        local_drift=$(chezmoi status 2>/dev/null | wc -l | tr -d ' ')
-    fi
-    if [ "$local_drift" = "0" ]; then
-        sync_status="{{green}}clean{{reset}}"
+    local_sync_json=$(cat "$HOME/.local/share/nit/last-sync.json" 2>/dev/null || echo "")
+    if [ -z "$local_sync_json" ]; then
+        sync_summary="{{yellow}}never synced{{reset}}"
     else
-        sync_status="{{yellow}}${local_drift} drifted{{reset}}"
+        read result drift_n <<< "$(read_sync "$local_sync_json")"
+        case "$result" in
+            ok)              sync_summary="{{green}}ok{{reset}}" ;;
+            aborted_drift)   sync_summary="{{yellow}}drift:${drift_n}{{reset}}" ;;
+            pull_failed)     sync_summary="{{red}}pull-fail{{reset}}" ;;
+            triggers_failed) sync_summary="{{yellow}}trigger-fail{{reset}}" ;;
+            secrets_drift)   sync_summary="{{yellow}}secrets-drift{{reset}}" ;;
+            edit_touched)    sync_summary="{{yellow}}edit-touched{{reset}}" ;;
+            *)               sync_summary="?" ;;
+        esac
     fi
-    local_hostname=$(hostname -s 2>/dev/null || hostname)
-    printf "%-12s %-10s $(printf '{{green}}')%-8s$(printf '{{reset}}') %-12s %-20s %-16b %s\n" \
-        "$local_hostname" "primary" "up" "$local_hash" "$local_uptime" "$sync_status" "-"
+    printf "%-12s %-10s $(printf '{{green}}')%-8s$(printf '{{reset}}') %-12s %-20s %-20b %s\n" \
+        "$(hostname -s | cut -c1-12)" "local" "up" "$local_hash" "$local_uptime" "$sync_summary" "-"
 
     # Remote machines in parallel
     sysdir_base="{{system_dir}}"
@@ -122,22 +115,22 @@ status:
         IFS=: read -r name host role critical <<< "$entry"
         (
             if ssh -o ConnectTimeout=3 -o BatchMode=yes "$host" "true" 2>/dev/null; then
-                remote_hash=$(ssh -o ConnectTimeout=5 "$host" "git -C \"\${HEMMA_DOTFILES:-\$HOME/dotfiles}\" rev-parse --short HEAD 2>/dev/null || echo 'n/a'")
+                remote_hash=$(ssh -o ConnectTimeout=5 "$host" "git --git-dir=\$HOME/.local/share/nit/repo.git rev-parse --short HEAD 2>/dev/null || echo 'n/a'")
                 remote_uptime=$(ssh -o ConnectTimeout=5 "$host" "uptime" 2>/dev/null | sed 's/.*up //' | sed 's/,.*//')
-
-                # Detect remote sync tool and check status
-                remote_sync="n/a"
-                if ssh -o ConnectTimeout=5 "$host" "command -v nit >/dev/null 2>&1" 2>/dev/null; then
-                    remote_sync=$(ssh -o ConnectTimeout=5 "$host" "nit status --count 2>/dev/null || echo 'n/a'" 2>/dev/null)
-                elif ssh -o ConnectTimeout=5 "$host" "command -v chezmoi >/dev/null 2>&1" 2>/dev/null; then
-                    remote_sync=$(ssh -o ConnectTimeout=5 "$host" "chezmoi status 2>/dev/null | wc -l | tr -d ' '" 2>/dev/null || echo "n/a")
-                fi
-                if [ "$remote_sync" = "0" ]; then
-                    cstatus="clean"
-                elif [ "$remote_sync" = "n/a" ]; then
-                    cstatus="not installed"
+                remote_sync_json=$(ssh -o ConnectTimeout=5 "$host" "cat ~/.local/share/nit/last-sync.json 2>/dev/null || echo ''" 2>/dev/null)
+                if [ -z "$remote_sync_json" ]; then
+                    cstatus="never synced"
                 else
-                    cstatus="${remote_sync} drifted"
+                    read result drift_n <<< "$(read_sync "$remote_sync_json")"
+                    case "$result" in
+                        ok)              cstatus="ok" ;;
+                        aborted_drift)   cstatus="drift:${drift_n}" ;;
+                        pull_failed)     cstatus="pull-fail" ;;
+                        triggers_failed) cstatus="trigger-fail" ;;
+                        secrets_drift)   cstatus="secrets-drift" ;;
+                        edit_touched)    cstatus="edit-touched" ;;
+                        *)               cstatus="?" ;;
+                    esac
                 fi
 
                 # System overlay drift check (OS-aware path mapping)
@@ -161,13 +154,13 @@ status:
                     drift_total=0
                     r_os=$(ssh -o ConnectTimeout=5 "$host" "uname -s" 2>/dev/null || echo "unknown")
                     for base in etc opt usr Library; do
-                        [ -d "$sysdir_base/common/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/common/$base/" "$sys_merge/$base/" 2>/dev/null
+                        [ -d "$sysdir_base/common/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/common/$base/" "$sys_merge/$base/" 2>/dev/null
                         # Role overlays
                         IFS=',' read -ra _rl <<< "$role"
                         for _r in "${_rl[@]}"; do
-                            [ -d "$sysdir_base/roles/$_r/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/roles/$_r/$base/" "$sys_merge/$base/" 2>/dev/null
+                            [ -d "$sysdir_base/roles/$_r/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/roles/$_r/$base/" "$sys_merge/$base/" 2>/dev/null
                         done
-                        [ -d "$sysdir_base/$name/$base" ] && rsync -a --exclude='.hemma-perms' --exclude='.hemma-hooks' "$sysdir_base/$name/$base/" "$sys_merge/$base/" 2>/dev/null
+                        [ -d "$sysdir_base/$name/$base" ] && rsync -a --exclude='.hemma-perms' "$sysdir_base/$name/$base/" "$sys_merge/$base/" 2>/dev/null
                     done
                     # Remap Library paths for Linux targets
                     if [ "$r_os" != "Darwin" ] && [ -d "$sys_merge/Library/Fonts" ]; then
@@ -181,8 +174,8 @@ status:
                     for dir in "$sys_merge"/*/; do
                         [ -d "$dir" ] || continue
                         base=$(basename "$dir")
-                        drift_n=$(rsync -e "ssh -o ConnectTimeout=5" --dry-run --itemize-changes --checksum -rltD \
-                            "$dir" "$host:/$base/" 2>/dev/null | grep '^[<>]f' | wc -l | tr -d ' ')
+                        drift_n=$(rsync -e "ssh -o ConnectTimeout=5" --rsync-path="sudo rsync" --dry-run --itemize-changes --checksum -rltD \
+                            "$dir" "$host:/$base/" 2>/dev/null | grep -c '^[<>]f' || true)
                         drift_total=$((drift_total + drift_n))
                     done
                     if [ "$drift_total" = "0" ]; then
@@ -194,7 +187,7 @@ status:
                 fi
 
                 crit_marker=""
-                if [ "$critical" = "true" ]; then crit_marker=" !"; fi
+                if [ "$critical" = "true" ]; then crit_marker=" ⚠"; fi
                 printf "%-12s %-10s %-8s %-12s %-20s %-16s %s%s\n" \
                     "$name" "$role" "up" "$remote_hash" "$remote_uptime" "$cstatus" "$sys_drift" "$crit_marker"
             else
@@ -205,7 +198,7 @@ status:
     done
     wait
 
-# Apply dotfile sync on a specific host
+# Apply nit update on a specific host (nit's abort-on-drift is respected)
 apply host:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -234,7 +227,7 @@ apply host:
     fi
 
     if [ "$is_critical" = "true" ]; then
-        printf "{{yellow}}WARNING{{reset}}: {{host}} is marked as CRITICAL infrastructure.\n"
+        printf "{{yellow}}⚠ WARNING{{reset}}: {{host}} is marked as CRITICAL infrastructure.\n"
         printf "Applying changes may affect network connectivity for all machines.\n"
         printf "Continue? [y/N] "
         read -r confirm
@@ -244,20 +237,21 @@ apply host:
         fi
     fi
 
-    # Detect remote sync tool
-    sync_cmd="echo 'ERROR: neither nit nor chezmoi found on remote'"
-    if ssh -o ConnectTimeout=5 "$target_host" "command -v nit >/dev/null 2>&1" 2>/dev/null; then
-        sync_cmd="nit update"
-    elif ssh -o ConnectTimeout=5 "$target_host" "command -v chezmoi >/dev/null 2>&1" 2>/dev/null; then
-        sync_cmd="chezmoi update --no-tty"
-    fi
-
-    printf "{{cyan}}hemma{{reset}}: applying to {{host}} ($target_host)...\n"
-    ssh "$target_host" "$sync_cmd 2>&1" || {
-        printf "{{red}}Failed{{reset}}: sync on {{host}} exited with $?\n"
-        exit 1
+    printf "{{cyan}}hemma{{reset}}: running nit update on {{host}} ($target_host)...\n"
+    ssh "$target_host" "nit update 2>&1" || {
+        rc=$?
+        if [ "$rc" = "1" ]; then
+            # nit update exit 1 on abort-on-drift — show the drift details + abort hemma
+            printf "{{yellow}}BLOCKED{{reset}}: nit update aborted on {{host}} — drift detected.\n"
+            printf "  Check status: ssh $target_host 'cat ~/.local/share/nit/last-sync.json'\n"
+            printf "  Or:           ssh $target_host 'nit status' — then resolve drift manually.\n"
+            exit 1
+        else
+            printf "{{red}}Failed{{reset}}: nit update on {{host}} exited with $rc\n"
+            exit 1
+        fi
     }
-    printf "{{green}}Done{{reset}}: {{host}} synced.\n"
+    printf "{{green}}Done{{reset}}: {{host}} nit updated.\n"
 
     # Auto-chain system overlay if host has overlay configs
     resolved_name=""
@@ -292,7 +286,7 @@ apply host:
         just system-apply "{{host}}" --yes
     fi
 
-# Apply dotfile sync on all non-critical hosts (parallel)
+# Apply nit update on all non-critical hosts (parallel)
 apply-all *flags:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -317,19 +311,16 @@ apply-all *flags:
 
         (
             printf "  applying %s..." "$name" > "$tmpdir/$name.status"
-
-            # Detect remote sync tool
-            sync_cmd="echo 'ERROR: no sync tool found'"
-            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "command -v nit >/dev/null 2>&1" 2>/dev/null; then
-                sync_cmd="nit update"
-            elif ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "command -v chezmoi >/dev/null 2>&1" 2>/dev/null; then
-                sync_cmd="chezmoi update --no-tty"
-            fi
-
-            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "$sync_cmd" > "$tmpdir/$name.log" 2>&1; then
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_host" "nit update" > "$tmpdir/$name.log" 2>&1; then
                 printf "  {{green}}✓{{reset}} %s\n" "$name" > "$tmpdir/$name.status"
             else
-                printf "  {{red}}✗{{reset}} %s (exit $?)\n" "$name" > "$tmpdir/$name.status"
+                rc=$?
+                # Inspect nit exit code via log: "aborted: pre-pull drift" = drift abort, not failure
+                if grep -q "aborted: pre-pull drift" "$tmpdir/$name.log" 2>/dev/null; then
+                    printf "  {{yellow}}⊘{{reset}} %s (drift — resolve manually, see log)\n" "$name" > "$tmpdir/$name.status"
+                else
+                    printf "  {{red}}✗{{reset}} %s (exit $rc)\n" "$name" > "$tmpdir/$name.status"
+                fi
             fi
         ) &
         pids+=($!)
@@ -358,37 +349,21 @@ apply-all *flags:
 bootstrap host ip user="":
     #!/usr/bin/env bash
     set -euo pipefail
-
-    # Find bootstrap.sh — check dotfiles repo first, then hemma dir
     script="{{dotfiles_dir}}/bootstrap.sh"
     if [ ! -f "$script" ]; then
-        script="{{hemma_dir}}/bootstrap.sh"
-    fi
-    if [ ! -f "$script" ]; then
-        printf "{{red}}Error{{reset}}: bootstrap.sh not found in {{dotfiles_dir}} or {{hemma_dir}}\n"
-        printf "Create a bootstrap.sh that installs dependencies, generates age+SSH keys, sets zsh.\n"
+        printf "{{red}}Error{{reset}}: bootstrap.sh not found in {{dotfiles_dir}}\n"
         exit 1
     fi
 
-    # Configure your dotfiles repo here
-    dotfiles_repo="${HEMMA_DOTFILES_REPO:-}"
-    dotfiles_ssh="${HEMMA_DOTFILES_SSH:-}"
-
-    if [ -z "$dotfiles_repo" ] || [ -z "$dotfiles_ssh" ]; then
-        printf "{{red}}Error{{reset}}: Set HEMMA_DOTFILES_REPO and HEMMA_DOTFILES_SSH environment variables.\n"
-        printf "  Example:\n"
-        printf "    export HEMMA_DOTFILES_REPO=youruser/dotfiles\n"
-        printf "    export HEMMA_DOTFILES_SSH=git@github.com:youruser/dotfiles.git\n"
+    # The dotfiles repo the new machine pulls from. Set both, or let hemma read
+    # them from nit's remote.
+    dotfiles_ssh="${HEMMA_DOTFILES_SSH:-$(nit remote get-url origin 2>/dev/null || true)}"
+    dotfiles_repo="${HEMMA_DOTFILES_REPO:-$(printf '%s' "$dotfiles_ssh" | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')}"
+    if [ -z "$dotfiles_ssh" ] || [ -z "$dotfiles_repo" ]; then
+        printf "{{red}}Error{{reset}}: set HEMMA_DOTFILES_SSH (git@github.com:you/dotfiles.git) and HEMMA_DOTFILES_REPO (you/dotfiles)\n"
         exit 1
     fi
-
-    # Detect dotfile manager config template
-    toml_tmpl=""
-    if [ -f "{{dotfiles_dir}}/home/.chezmoi.toml.tmpl" ]; then
-        toml_tmpl="{{dotfiles_dir}}/home/.chezmoi.toml.tmpl"
-    elif [ -f "{{dotfiles_dir}}/.chezmoi.toml.tmpl" ]; then
-        toml_tmpl="{{dotfiles_dir}}/.chezmoi.toml.tmpl"
-    fi
+    
 
     target_user="{{user}}"
     if [ -z "$target_user" ]; then
@@ -424,104 +399,69 @@ bootstrap host ip user="":
         printf "{{yellow}}  ⚠{{reset}} deploy key may already exist (harmless)\n"
     fi
 
-    # --- Step 5: Add age recipient + re-encrypt ---
-    printf "\n{{bold}}Step 5: Adding age recipient...{{reset}}\n"
-
-    # Detect age key location (nit uses ~/.config/nit/key.txt, chezmoi uses ~/.config/chezmoi/key.txt)
-    age_pubkey=""
-    for key_path in ~/.config/nit/key.txt ~/.config/chezmoi/key.txt; do
-        result=$(ssh "$remote" "grep 'public key:' $key_path 2>/dev/null | cut -d: -f2 | tr -d ' '" 2>/dev/null || true)
-        if [ -n "$result" ]; then
-            age_pubkey="$result"
-            break
-        fi
-    done
-
+    # --- Step 5: Add age recipient to tier-all + nit rekey ---
+    # Automated via `nit fleet-add-recipient` (idempotent). Adds to tier-all
+    # (always applies — all fleet machines need AI/MCP keys), then re-encrypts
+    # .age files. Additional tier memberships are left to the operator — a
+    # reminder is printed after tier-all.
+    printf "\n{{bold}}Step 5: Adding age recipient to tier-all...{{reset}}\n"
+    nit_bin=$(command -v nit || echo "$HOME/.local/bin/nit")
+    [ -x "$nit_bin" ] || nit_bin="$HOME/.cargo/bin/nit"
+    age_pubkey=$(ssh "$remote" "(cat ~/.config/nit/age-key.txt 2>/dev/null || cat ~/.config/chezmoi/key.txt 2>/dev/null) | grep 'public key:' | cut -d: -f2 | tr -d ' '")
     if [ -z "$age_pubkey" ]; then
-        printf "{{red}}  ✗{{reset}} Could not read age public key from {{host}}\n"
-        printf "    Manual fix: ssh $remote 'cat ~/.config/nit/key.txt' (or chezmoi/key.txt)\n"
-    elif [ -n "$toml_tmpl" ] && grep -q "$age_pubkey" "$toml_tmpl" 2>/dev/null; then
-        printf "{{green}}  ✓{{reset}} age recipient already in config template\n"
-    elif [ -n "$toml_tmpl" ]; then
-        # Insert new recipient before the closing bracket in recipients array
-        insert_line="        \"${age_pubkey}\","
-        awk -v line="$insert_line" '
-            /recipients = \[/ { in_block=1 }
-            in_block && /^[[:space:]]*\]/ { print line; in_block=0 }
-            { print }
-        ' "$toml_tmpl" > "${toml_tmpl}.tmp" && mv "${toml_tmpl}.tmp" "$toml_tmpl"
-
-        if grep -q "$age_pubkey" "$toml_tmpl"; then
-            printf "{{green}}  ✓{{reset}} age recipient added: %s\n" "$age_pubkey"
-        else
-            printf "{{red}}  ✗{{reset}} Failed to add age recipient to config template\n"
-            printf "    Manual fix: add \"%s\" to recipients list\n" "$age_pubkey"
-        fi
-
-        # Commit the change
-        cd "{{dotfiles_dir}}"
-        git add "$toml_tmpl"
-        git commit -m "hemma: add {{host}} age recipient" "$toml_tmpl" 2>/dev/null || true
-
-        # Re-encrypt secrets for new recipient
-        printf "{{cyan}}hemma{{reset}}: re-encrypting secrets for new recipient...\n"
-        if command -v nit >/dev/null 2>&1; then
-            nit rekey
-        elif [ -x "$HOME/.local/bin/chezmoi-re-encrypt" ]; then
-            "$HOME/.local/bin/chezmoi-re-encrypt"
-        else
-            printf "{{yellow}}  ⚠{{reset}} No rekey tool found — re-encrypt secrets manually\n"
-        fi
-
-        # Push
-        git push 2>/dev/null || true
-        printf "{{green}}  ✓{{reset}} secrets re-encrypted and pushed\n"
+        printf "{{red}}  ✗{{reset}} Could not read age pubkey from {{host}}\n"
+        printf "    Manual fix: ssh $remote 'cat ~/.config/nit/age-key.txt'\n"
+    elif ! [[ "$age_pubkey" =~ ^age1 ]]; then
+        printf "{{red}}  ✗{{reset}} Pubkey read from {{host}} is malformed: %s\n" "$age_pubkey"
     else
-        printf "{{yellow}}  ⚠{{reset}} No config template found — add age recipient manually\n"
-        printf "    Public key: %s\n" "$age_pubkey"
+        printf "{{cyan}}  →{{reset}} pubkey: %s\n" "$age_pubkey"
+        if "$nit_bin" fleet-add-recipient tier-all "$age_pubkey" --comment "{{host}}" 2>&1; then
+            printf "{{green}}  ✓{{reset}} added to tier-all\n"
+            if "$nit_bin" rekey 2>&1 | tail -3; then
+                printf "{{green}}  ✓{{reset}} nit rekey succeeded (.age files re-encrypted)\n"
+            else
+                printf "{{yellow}}  ⚠{{reset}} nit rekey failed — run manually: nit rekey\n"
+            fi
+        else
+            printf "{{yellow}}  ⚠{{reset}} fleet-add-recipient failed\n"
+        fi
+        printf "\n{{yellow}}  Other tiers to consider for {{host}}:{{reset}}\n"
+        printf "    any other secret tier in fleet.toml this host should read\n"
+        printf "    Add via: nit fleet-add-recipient <tier> %s --comment {{host}} && nit rekey\n" "$age_pubkey"
     fi
 
-    # --- Step 6: Run dotfile manager init on remote ---
-    printf "\n{{bold}}Step 6: Initializing dotfile manager on {{host}}...{{reset}}\n"
-    sync_ok=false
-    if ssh -o ConnectTimeout=5 "$remote" "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no git@github.com 2>&1 | grep -q 'successfully authenticated'" 2>/dev/null; then
-        printf "{{cyan}}hemma{{reset}}: {{host}} can reach GitHub — running init\n"
-
-        # Try nit first, then chezmoi
-        init_cmd=""
-        if ssh -o ConnectTimeout=5 "$remote" "command -v nit >/dev/null 2>&1" 2>/dev/null; then
-            init_cmd="nit init --apply $dotfiles_ssh"
-        else
-            init_cmd="PATH=\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH chezmoi init --apply $dotfiles_ssh"
-        fi
-
-        if ssh "$remote" "$init_cmd" 2>&1; then
-            printf "{{green}}  ✓{{reset}} dotfile manager initialized and applied on {{host}}\n"
-            sync_ok=true
-        else
-            printf "{{yellow}}  ⚠{{reset}} init failed — run manually when resolved:\n"
-            printf "    ssh $remote '$init_cmd'\n"
-        fi
+    # --- Step 6: Install nit + bootstrap on remote ---
+    # Delegated to scripts/install-nit-on-host.sh (extracted May 3, 2026 because
+    # Just 1.46+ rejects `\"` in recipe bodies AND interprets heredoc-body lines
+    # like `machine = '{{host}}'` as top-level Just assignments — both
+    # incompatible with inline ssh+heredoc TOML writing).
+    printf "\n{{bold}}Step 6: Installing nit + bootstrapping on {{host}}...{{reset}}\n"
+    deploy_ok=false
+    helper="$(dirname "$(realpath "$0")")/scripts/install-nit-on-host.sh"
+    if [ ! -x "$helper" ]; then
+        helper="{{hemma_dir}}/scripts/install-nit-on-host.sh"
+    fi
+    if [ -x "$helper" ] && "$helper" "$remote" "{{host}}" "$dotfiles_ssh"; then
+        deploy_ok=true
     else
-        printf "{{yellow}}  ⚠{{reset}} {{host}} cannot reach github.com (no internet?) — skipping init\n"
-        printf "  Run when internet is available:\n"
-        printf "    ssh $remote 'nit init --apply $dotfiles_ssh'  # or chezmoi init --apply\n"
+        printf "{{yellow}}  ⚠{{reset}} install-nit-on-host.sh failed (exit $?) — see output above for retry guidance\n"
     fi
 
     # --- Step 7: Apply system config overlay ---
-    sysdir="{{system_dir}}"
+    sysdir="$(dirname "$(realpath "$0")")/../system"
     if [ -d "$sysdir/common" ] || [ -d "$sysdir/{{host}}" ]; then
         printf "\n{{bold}}Step 7: Applying system config overlay...{{reset}}\n"
-        if [ "$sync_ok" = true ]; then
-            if just system-apply "{{host}}" --yes 2>&1; then
+        if [ "$deploy_ok" = true ]; then
+            justdir="$(dirname "$(realpath "$0")")"
+            if just --justfile "$justdir/Justfile" system-apply "{{host}}" --yes 2>&1; then
                 printf "{{green}}  ✓{{reset}} system overlay applied to {{host}}\n"
             else
                 printf "{{yellow}}  ⚠{{reset}} system-apply failed — run manually:\n"
                 printf "    hemma system-apply {{host}}\n"
             fi
         else
-            printf "{{yellow}}  ⚠{{reset}} skipping system-apply (dotfile manager not initialized yet)\n"
-            printf "  After init, run: hemma system-apply {{host}}\n"
+            printf "{{yellow}}  ⚠{{reset}} skipping system-apply (nit bootstrap didn't complete yet)\n"
+            printf "  After nit bootstrap, run: hemma system-apply {{host}}\n"
         fi
     fi
 
@@ -529,10 +469,10 @@ bootstrap host ip user="":
     printf "\n{{bold}}{{green}}Bootstrap complete for {{host}}!{{reset}}\n"
     has_manual=false
 
-    if [ "$sync_ok" = false ]; then
+    if [ "$deploy_ok" = false ]; then
         has_manual=true
         printf "\n{{bold}}{{yellow}}Deferred steps (need internet):{{reset}}\n"
-        printf "  1. ssh $remote 'nit init --apply $dotfiles_ssh'  # or chezmoi\n"
+        printf "  1. ssh $remote 'cargo install --git https://github.com/semikolon/nit --root ~/.local && nit bootstrap $dotfiles_ssh'\n"
         if [ -d "$sysdir/common" ] || [ -d "$sysdir/{{host}}" ]; then
             printf "  2. hemma system-apply {{host}}\n"
         fi
@@ -541,11 +481,10 @@ bootstrap host ip user="":
     # Check for remaining manual steps
     manual_items=""
     if ! grep -q "Host {{host}}" "$HOME/.ssh/config" 2>/dev/null; then
-        manual_items="${manual_items}\n  - Add SSH config entry: Host {{host}} / HostName {{ip}} / User ${target_user}"
+        manual_items="${manual_items}\n  • Add SSH config entry: Host {{host}} / HostName {{ip}} / User ${target_user}"
     fi
-    fleet_toml="{{dotfiles_dir}}/fleet.toml"
-    if [ -f "$fleet_toml" ] && ! grep -q "{{host}}" "$fleet_toml" 2>/dev/null; then
-        manual_items="${manual_items}\n  - Add {{host}} to fleet.toml"
+    if ! grep -q "{{host}}" "{{dotfiles_dir}}/fleet.toml" 2>/dev/null; then
+        manual_items="${manual_items}\n  • Add {{host}} to {{dotfiles_dir}}/fleet.toml"
     fi
     if [ -n "$manual_items" ]; then
         has_manual=true
@@ -679,16 +618,9 @@ system-diff host:
     # Decrypt secrets if any exist
     for base in $source_bases; do
         if [ -d "$sysdir/secrets/$host_name/$base" ]; then
-            # Try nit key location first, then chezmoi
-            age_key=""
-            for key_path in "$HOME/.config/nit/key.txt" "$HOME/.config/chezmoi/key.txt"; do
-                if [ -f "$key_path" ]; then
-                    age_key="$key_path"
-                    break
-                fi
-            done
-            if [ -z "$age_key" ]; then
-                printf "{{red}}Error{{reset}}: age key not found (checked ~/.config/nit/key.txt and ~/.config/chezmoi/key.txt)\n"
+            age_key="$HOME/.config/nit/age-key.txt"
+            if [ ! -f "$age_key" ]; then
+                printf "{{red}}Error{{reset}}: age key not found at %s\n" "$age_key"
                 exit 1
             fi
             find "$sysdir/secrets/$host_name/$base" -name "*.age" -type f | while read -r agefile; do
@@ -700,8 +632,10 @@ system-diff host:
         fi
     done
 
-    # Remove .hemma-perms and .hemma-hooks from merge (not deployed to remote)
+    # Remove .hemma-perms from merge (not deployed to remote)
     find "$mergedir" -name ".hemma-perms" -delete 2>/dev/null || true
+
+    # Remove .hemma-hooks from merge (metadata, not deployed to remote — run by executor)
     find "$mergedir" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Remap macOS paths to Linux equivalents on non-Darwin hosts
@@ -726,94 +660,39 @@ system-diff host:
     printf "{{bold}}{{cyan}}hemma{{reset}} — system-diff for %s (%s)\n\n" "$host_name" "$target_host"
 
     # Dry-run rsync per deploy base to show what would change
+    total_new=0
     total_changed=0
     for base in $deploy_bases; do
         if [ -d "$mergedir/$base" ]; then
-            raw=$(rsync -e "ssh" --dry-run --itemize-changes --checksum -rltD \
+            raw=$(rsync -e "ssh" --rsync-path="sudo rsync" --dry-run --itemize-changes --checksum -rltD \
                 "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
             if [ -n "$raw" ]; then
-                # Use rsync-humanize if available, otherwise show raw
-                if command -v rsync-humanize >/dev/null 2>&1; then
-                    echo "$raw" | rsync-humanize "$base"
-                else
-                    echo "$raw" | sed "s|^|  /$base/|"
-                fi
-                # Count actual content changes (not timestamp-only)
-                n=$(echo "$raw" | grep -E '^[<>][^ ]*[cs]' | wc -l | tr -d ' ')
-                total_changed=$((total_changed + n))
+                echo "$raw" | rsync-humanize "$base"
+                # Count NEW files (rsync flag `>f+++++++++` — pluses replace c/s)
+                n_new=$(echo "$raw" | grep -cE '^[<>]f[^ ]*\+\+\+\+' || true)
+                # Count CHANGED files (`>fc......` or `>f.s....` — content differs)
+                # Constrain c/s match to flags only (before space) — filenames
+                # like "Cardo" or "CircularStd" contain c/s and would otherwise
+                # be mis-counted as CHANGED.
+                n_chg=$(echo "$raw" | grep -cE '^[<>]f[^ ]*[cs]' || true)
+                total_new=$((total_new + n_new))
+                total_changed=$((total_changed + n_chg))
             fi
         fi
     done
 
-    if [ "$total_changed" -eq 0 ]; then
+    total_active=$((total_new + total_changed))
+    if [ "$total_active" -eq 0 ]; then
         printf "{{green}}No content changes needed.{{reset}}\n"
     else
-        printf "\n{{bold}}%d file(s) with content changes.{{reset}}\n" "$total_changed"
-
-        # Preview which hooks would fire
-        # Collect changed files from dry-run (same pattern as system-apply)
-        diff_changed_files=""
-        for base in $deploy_bases; do
-            if [ -d "$mergedir/$base" ]; then
-                diff_raw=$(rsync -e "ssh" --dry-run --itemize-changes --checksum -rltD \
-                    "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
-                diff_base_changed=$(echo "$diff_raw" | grep -E '^[<>][^ ]*[cs]' | awk '{print $2}' || true)
-                if [ -n "$diff_base_changed" ]; then
-                    while IFS= read -r cf; do
-                        diff_changed_files="${diff_changed_files}${base}/${cf}"$'\n'
-                    done <<< "$diff_base_changed"
-                fi
-            fi
-        done
-        # Collect hooks from all overlay layers
-        diff_hooks_files=()
-        for base in $source_bases; do
-            if [ -f "$sysdir/common/$base/.hemma-hooks" ]; then
-                diff_hooks_files+=("$base:$sysdir/common/$base/.hemma-hooks")
-            fi
-            IFS=',' read -ra _dhrl <<< "$host_role"
-            for _dhr in "${_dhrl[@]}"; do
-                if [ -f "$sysdir/roles/$_dhr/$base/.hemma-hooks" ]; then
-                    diff_hooks_files+=("$base:$sysdir/roles/$_dhr/$base/.hemma-hooks")
-                fi
-            done
-            if [ -f "$sysdir/$host_name/$base/.hemma-hooks" ]; then
-                diff_hooks_files+=("$base:$sysdir/$host_name/$base/.hemma-hooks")
-            fi
-        done
-        if [ -n "$diff_changed_files" ] && [ "${#diff_hooks_files[@]}" -gt 0 ]; then
-            hooks_preview=""
-            declare -A preview_seen
-            for entry in "${diff_hooks_files[@]}"; do
-                hook_base="${entry%%:*}"
-                hook_file="${entry#*:}"
-                [ -f "$hook_file" ] || continue
-                while IFS=: read -r glob cmd || [ -n "$glob" ]; do
-                    [[ "$glob" =~ ^[[:space:]]*# ]] && continue
-                    [[ -z "${glob// /}" ]] && continue
-                    glob=$(echo "$glob" | xargs)
-                    cmd=$(echo "$cmd" | xargs)
-                    [ -z "$cmd" ] && continue
-                    [ "${preview_seen[$cmd]+_}" ] && continue
-                    while IFS= read -r changed; do
-                        [ -z "$changed" ] && continue
-                        changed_base="${changed%%/*}"
-                        changed_rel="${changed#*/}"
-                        [ "$changed_base" != "$hook_base" ] && continue
-                        case "$changed_rel" in
-                            $glob)
-                                hooks_preview="${hooks_preview}  ${hook_base}/${glob} → ${cmd}\n"
-                                preview_seen[$cmd]=1
-                                break
-                                ;;
-                        esac
-                    done <<< "$diff_changed_files"
-                done < "$hook_file"
-            done
-            if [ -n "$hooks_preview" ]; then
-                printf "\n{{bold}}Hooks that would fire:{{reset}}\n"
-                printf "%b" "$hooks_preview"
-            fi
+        # Break out NEW vs CHANGED so a stale role merge (today's incident:
+        # 25 router-era NEW files silently deployed) becomes visible.
+        if [ "$total_new" -gt 0 ] && [ "$total_changed" -gt 0 ]; then
+            printf "\n{{bold}}%d NEW + %d CHANGED file(s) — review NEW carefully (esp. for stale role-merge surprises).{{reset}}\n" "$total_new" "$total_changed"
+        elif [ "$total_new" -gt 0 ]; then
+            printf "\n{{bold}}%d NEW file(s) — review carefully (esp. for stale role-merge surprises).{{reset}}\n" "$total_new"
+        else
+            printf "\n{{bold}}%d file(s) with content changes.{{reset}}\n" "$total_changed"
         fi
     fi
 
@@ -827,8 +706,13 @@ system-apply host *flags:
     is_critical=false
     skip_confirm=false
 
+    hook_flags=()
     for flag in {{flags}}; do
-        if [ "$flag" = "--yes" ]; then skip_confirm=true; fi
+        case "$flag" in
+            --yes) skip_confirm=true ;;
+            --no-hooks|--no-disruptive-hooks|--run-risky-hooks|--run-untagged-hooks|--dry-run-hooks)
+                hook_flags+=("$flag") ;;
+        esac
     done
 
     # Resolve host to SSH alias and canonical name
@@ -880,7 +764,7 @@ system-apply host *flags:
 
     # Critical host gate
     if [ "$is_critical" = "true" ] && [ "$skip_confirm" = "false" ]; then
-        printf "{{yellow}}WARNING{{reset}}: %s is marked as CRITICAL infrastructure.\n" "$host_name"
+        printf "{{yellow}}⚠ WARNING{{reset}}: %s is marked as CRITICAL infrastructure.\n" "$host_name"
         printf "System config changes may affect network connectivity for all machines.\n"
         printf "Continue? [y/N] "
         read -r confirm
@@ -892,7 +776,8 @@ system-apply host *flags:
 
     # Merge: common → roles → host-specific (last wins)
     mergedir=$(mktemp -d)
-    trap 'rm -rf "$mergedir"' EXIT
+    changes_file=$(mktemp)
+    trap 'rm -rf "$mergedir" "$changes_file"' EXIT
 
     role_files_list=""
     for base in $source_bases; do
@@ -939,16 +824,9 @@ system-apply host *flags:
     # Decrypt secrets if any exist
     for base in $source_bases; do
         if [ -d "$sysdir/secrets/$host_name/$base" ]; then
-            # Try nit key location first, then chezmoi
-            age_key=""
-            for key_path in "$HOME/.config/nit/key.txt" "$HOME/.config/chezmoi/key.txt"; do
-                if [ -f "$key_path" ]; then
-                    age_key="$key_path"
-                    break
-                fi
-            done
-            if [ -z "$age_key" ]; then
-                printf "{{red}}Error{{reset}}: age key not found (checked ~/.config/nit/key.txt and ~/.config/chezmoi/key.txt)\n"
+            age_key="$HOME/.config/nit/age-key.txt"
+            if [ ! -f "$age_key" ]; then
+                printf "{{red}}Error{{reset}}: age key not found at %s\n" "$age_key"
                 exit 1
             fi
             find "$sysdir/secrets/$host_name/$base" -name "*.age" -type f | while read -r agefile; do
@@ -961,16 +839,18 @@ system-apply host *flags:
     done
 
     # Capture perms manifests from original sources (NOT merge dir — it gets cleaned)
-    # Common perms first, then host-specific overrides (last wins for duplicate paths)
+    # Order: common → roles → host-specific (last wins for duplicate paths) —
+    # mirrors the file-merge + hook-collection order so a role can set the mode of
+    # an executable it ships (e.g. roles/boot-splash/usr/local/sbin/boot-splash-apply).
     perms_files=()
     for base in $source_bases; do
         if [ -f "$sysdir/common/$base/.hemma-perms" ]; then
             perms_files+=("$base:$sysdir/common/$base/.hemma-perms")
         fi
-        IFS=',' read -ra _prl <<< "$host_role"
-        for _pr in "${_prl[@]}"; do
-            if [ -f "$sysdir/roles/$_pr/$base/.hemma-perms" ]; then
-                perms_files+=("$base:$sysdir/roles/$_pr/$base/.hemma-perms")
+        IFS=',' read -ra _perm_roles <<< "$host_role"
+        for r in "${_perm_roles[@]}"; do
+            if [ -f "$sysdir/roles/$r/$base/.hemma-perms" ]; then
+                perms_files+=("$base:$sysdir/roles/$r/$base/.hemma-perms")
             fi
         done
         if [ -f "$sysdir/$host_name/$base/.hemma-perms" ]; then
@@ -978,25 +858,10 @@ system-apply host *flags:
         fi
     done
 
-    # Capture hooks manifests from all overlay layers (common → roles → host-specific)
-    hooks_files=()
-    for base in $source_bases; do
-        if [ -f "$sysdir/common/$base/.hemma-hooks" ]; then
-            hooks_files+=("$base:$sysdir/common/$base/.hemma-hooks")
-        fi
-        IFS=',' read -ra _hrl <<< "$host_role"
-        for _hr in "${_hrl[@]}"; do
-            if [ -f "$sysdir/roles/$_hr/$base/.hemma-hooks" ]; then
-                hooks_files+=("$base:$sysdir/roles/$_hr/$base/.hemma-hooks")
-            fi
-        done
-        if [ -f "$sysdir/$host_name/$base/.hemma-hooks" ]; then
-            hooks_files+=("$base:$sysdir/$host_name/$base/.hemma-hooks")
-        fi
-    done
-
-    # Remove .hemma-perms and .hemma-hooks from merge (not deployed to remote)
+    # Remove .hemma-perms from merge (not deployed to remote)
     find "$mergedir" -name ".hemma-perms" -delete 2>/dev/null || true
+
+    # Remove .hemma-hooks from merge (metadata, not deployed to remote — run by executor)
     find "$mergedir" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Remap macOS paths to Linux equivalents on non-Darwin hosts
@@ -1019,29 +884,43 @@ system-apply host *flags:
     fi
 
     # ── Drift check: warn if remote files were modified outside hemma ──
-    # Uses rsync --existing to compare only files we manage (overlay → remote).
-    # Reverse itemize (remote → local) detects remote-side modifications.
+    # Scope each rsync to a MANIFEST of the managed overlay files so the remote
+    # stats ONLY those ~N files — it must NEVER walk the entire remote /<base>/
+    # tree. A wholesale `host:/<base>/` source made the slow SBC walk all
+    # 82,951 /usr files = 3 m 26 s (measured 2026-05-17) just to filter down to
+    # ~3 managed files. `--files-from` is the ONLY rsync mechanism that skips
+    # the source-tree walk (`--existing`/`--include`/`--exclude` walk-then-
+    # filter). Detection semantics unchanged (reverse, --checksum, content-only
+    # c/s grep). Perf rationale: docs/DOTFILES_STRATEGY.md § hemma hooks.
+    # Regression: hemma/scripts/test-system-apply-preview.sh test [4].
     drift_list=""
     for base in $deploy_bases; do
         if [ -d "$mergedir/$base" ]; then
-            # --existing: only check files that exist in overlay (our managed set)
-            # Reverse direction: remote → overlay merge dir (read-only, dry-run)
-            # Only flag files with actual content changes (c=checksum, s=size)
-            base_drift=$(rsync -e "ssh" --rsync-path="sudo rsync" --dry-run --existing \
-                --itemize-changes --checksum -rltD \
-                "$target_host:/$base/" "$mergedir/$base/" 2>/dev/null \
-                | grep -E '^>f[^ ]*[cs]' || true)
-            if [ -n "$base_drift" ]; then
-                while IFS= read -r line; do
-                    fname=$(echo "$line" | awk '{print $2}')
-                    drift_list="${drift_list}  /$base/$fname\n"
-                done <<< "$base_drift"
+            # Manifest = managed overlay files, relative to the base root.
+            drift_mf=$(mktemp)
+            ( cd "$mergedir/$base" && find . -type f | sed 's|^\./||' ) > "$drift_mf"
+            if [ -s "$drift_mf" ]; then
+                # Reverse (remote → overlay), dry-run, content-only (c/s).
+                # --ignore-missing-args: a managed file not yet on the remote is
+                # a NEW deploy, not "drift" — skip it silently (no error).
+                base_drift=$(rsync -e "ssh" --rsync-path="sudo rsync" --dry-run \
+                    --files-from="$drift_mf" --ignore-missing-args \
+                    --itemize-changes --checksum -rltD \
+                    "$target_host:/$base/" "$mergedir/$base/" 2>/dev/null \
+                    | grep -E '^>f[^ ]*[cs]' || true)
+                if [ -n "$base_drift" ]; then
+                    while IFS= read -r line; do
+                        fname=$(echo "$line" | awk '{print $2}')
+                        drift_list="${drift_list}  /$base/$fname\n"
+                    done <<< "$base_drift"
+                fi
             fi
+            rm -f "$drift_mf"
         fi
     done
     if [ -n "$drift_list" ]; then
         drift_count=$(printf "%b" "$drift_list" | grep -c '/' || true)
-        printf "{{yellow}}Remote drift detected{{reset}} — %s file(s) on %s differ from overlay:\n" "$drift_count" "$host_name"
+        printf "{{yellow}}⚠ Remote drift detected{{reset}} — %s file(s) on %s differ from overlay:\n" "$drift_count" "$host_name"
         printf "%b" "$drift_list"
         printf "\nThese remote changes will be OVERWRITTEN.\n"
         if [ "$skip_confirm" = "false" ]; then
@@ -1107,17 +986,32 @@ system-apply host *flags:
     total_changed=0
     for base in $deploy_bases; do
         if [ -d "$mergedir/$base" ]; then
-            raw=$(rsync -e "ssh" --dry-run --itemize-changes --checksum -rltD \
+            raw=$(rsync -e "ssh" --rsync-path="sudo rsync" --dry-run --itemize-changes --checksum -rltD \
                 "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
             if [ -n "$raw" ]; then
-                # Use rsync-humanize if available, otherwise show raw
-                if command -v rsync-humanize >/dev/null 2>&1; then
-                    echo "$raw" | rsync-humanize "$base"
-                else
-                    echo "$raw" | sed "s|^|  /$base/|"
-                fi
-                n=$(echo "$raw" | grep -E '^[<>][^ ]*[cs]' | wc -l | tr -d ' ')
-                total_changed=$((total_changed + n))
+                echo "$raw" | rsync-humanize "$base"
+                # Mirror the two-regex pattern used in system-diff display
+                # (lines ~658+663): count NEW files (`>f++++...`) AND
+                # CHANGED files (`>fcs....`). The single-regex form
+                # `^[<>][^ ]*[cs]` missed new files entirely → hemma
+                # reported "No content changes needed" and exited without
+                # rsyncing a single new file. (Caught May 13, 2026 on
+                # first attempt to push a watchdog
+                # overlay — 5 NEW files, 0 modified, total_changed
+                # silently stayed 0.)
+                n_new=$(echo "$raw" | grep -cE '^[<>]f[^ ]*\+\+\+\+' || true)
+                n_chg=$(echo "$raw" | grep -cE '^[<>]f[^ ]*[cs]' || true)
+                total_changed=$((total_changed + n_new + n_chg))
+                # Capture content-changed/new file paths for hook matching
+                # (union of new+changed filters above). Format: <base>/<relpath>
+                # `|| true`: same pipefail guard as the n_new/n_chg greps
+                # above. A deploy-base whose preview yields no content-change
+                # lines (the common case, e.g. an unchanged usr/ base) OR an
+                # rsync error string → no-match grep → exit 1 → set -e aborts
+                # system-apply before the confirm/deploy/hooks without this.
+                # Regression: scripts/test-system-apply-preview.sh (May 17 2026).
+                echo "$raw" | grep -E '^[<>]f[^ ]*(\+\+\+\+|[cs])' \
+                    | awk -v b="$base" '{print b "/" $2}' >> "$changes_file" || true
             fi
         fi
     done
@@ -1138,20 +1032,11 @@ system-apply host *flags:
     fi
 
     # Deploy via rsync with sudo on remote per deploy base
-    # Capture itemize-changes to detect which files had actual content changes (for hooks)
     printf "{{cyan}}hemma{{reset}}: deploying system configs to %s...\n" "$host_name"
-    all_changed_files=""
     for base in $deploy_bases; do
         if [ -d "$mergedir/$base" ]; then
-            deploy_output=$(rsync -e "ssh" --rsync-path="sudo rsync" --itemize-changes -rltD \
-                "$mergedir/$base/" "$target_host:/$base/" 2>&1) || true
-            # Extract files with actual content changes (c=checksum, s=size)
-            base_changed=$(echo "$deploy_output" | grep -E '^[<>][^ ]*[cs]' | awk '{print $2}' || true)
-            if [ -n "$base_changed" ]; then
-                while IFS= read -r cf; do
-                    all_changed_files="${all_changed_files}${base}/${cf}"$'\n'
-                done <<< "$base_changed"
-            fi
+            rsync -e "ssh" --rsync-path="sudo rsync" -rltD \
+                "$mergedir/$base/" "$target_host:/$base/"
         fi
     done
 
@@ -1177,60 +1062,26 @@ system-apply host *flags:
         fi
     done
 
-    # Run post-deploy hooks for files with actual content changes
-    if [ -n "$all_changed_files" ] && [ "${#hooks_files[@]}" -gt 0 ]; then
-        hooks_run=0
-        # Track which commands already ran (each hook command runs at most once)
-        declare -A hooks_executed
-        for entry in "${hooks_files[@]}"; do
-            hook_base="${entry%%:*}"
-            hook_file="${entry#*:}"
-            [ -f "$hook_file" ] || continue
-            while IFS=: read -r glob cmd || [ -n "$glob" ]; do
-                # Skip comments and blank lines
-                [[ "$glob" =~ ^[[:space:]]*# ]] && continue
-                [[ -z "${glob// /}" ]] && continue
-                glob=$(echo "$glob" | xargs)  # trim whitespace
-                cmd=$(echo "$cmd" | xargs)
-                [ -z "$cmd" ] && continue
-                # Skip if this exact command already ran
-                [ "${hooks_executed[$cmd]+_}" ] && continue
-                # Check if any changed file matches this glob
-                matched=false
-                while IFS= read -r changed; do
-                    [ -z "$changed" ] && continue
-                    # changed is "base/path/to/file", glob is relative to base
-                    changed_base="${changed%%/*}"
-                    changed_rel="${changed#*/}"
-                    # Only match files in the same base as the hook
-                    [ "$changed_base" != "$hook_base" ] && continue
-                    # Use case for glob matching (bash extglob not needed for simple globs)
-                    case "$changed_rel" in
-                        $glob)
-                            matched=true
-                            break
-                            ;;
-                    esac
-                done <<< "$all_changed_files"
-                if [ "$matched" = "true" ]; then
-                    printf "  {{cyan}}hook{{reset}}: %s → %s\n" "$hook_base/$glob" "$cmd"
-                    if ssh "$target_host" "$cmd" 2>&1; then
-                        hooks_run=$((hooks_run + 1))
-                    else
-                        printf "  {{yellow}}WARNING{{reset}}: hook failed: %s\n" "$cmd"
-                        hooks_run=$((hooks_run + 1))
-                    fi
-                    hooks_executed[$cmd]=1
-                fi
-            done < "$hook_file"
-        done
-        if [ "$hooks_run" -gt 0 ]; then
-            printf "{{cyan}}hemma{{reset}}: %d hook(s) executed.\n" "$hooks_run"
-        fi
+    # Run .hemma-hooks for content-changed files (post-deploy)
+    hooks_script="{{hemma_dir}}/scripts/run-hooks.sh"
+    hook_failures=0
+    if [ -x "$hooks_script" ] && [ -s "$changes_file" ]; then
+        "$hooks_script" \
+            --host "$host_name" \
+            --target "$target_host" \
+            --sysdir "$sysdir" \
+            --role "$host_role" \
+            --changes-file "$changes_file" \
+            ${hook_flags[@]+"${hook_flags[@]}"} || hook_failures=$?
     fi
 
     # Auto-commit via etckeeper if available
     ssh "$target_host" "command -v etckeeper >/dev/null 2>&1 && sudo etckeeper commit 'hemma system-apply' 2>/dev/null || true"
+
+    if [ "$hook_failures" -gt 0 ]; then
+        printf "{{yellow}}Warning{{reset}}: hooks reported failures (see above). Deploy completed.\n"
+        exit 1
+    fi
 
     printf "{{green}}Done{{reset}}: system configs deployed to %s.\n" "$host_name"
 
@@ -1346,7 +1197,7 @@ system-pull host *flags:
     manifest=$(mktemp)
     tmpdir=$(mktemp -d)
     merge_src=$(mktemp -d)
-    trap 'rm -rf "$manifest" "$tmpdir" "$merge_src"' EXIT
+    trap 'rm -rf "$manifest" "$tmpdir" "$merge_src" "$secrets_list" 2>/dev/null' EXIT
 
     for base in $base_paths; do
         if [ -d "$sysdir/common/$base" ]; then
@@ -1367,6 +1218,7 @@ system-pull host *flags:
     find "$merge_src" -name ".hemma-hooks" -delete 2>/dev/null || true
 
     # Map merged files back to their overlay source paths
+    # Priority: host-specific > role > common (last-wins, same as system-apply merge)
     has_files=false
     for base in $base_paths; do
         if [ -d "$merge_src/$base" ]; then
@@ -1375,8 +1227,20 @@ system-pull host *flags:
                 relpath="${merged_file#$merge_src/$base/}"
                 if [ -f "$sysdir/$host_name/$base/$relpath" ]; then
                     printf "/$base/%s|%s|%s\n" "$relpath" "$sysdir/$host_name/$base/$relpath" "$host_name"
-                elif [ -f "$sysdir/common/$base/$relpath" ]; then
-                    printf "/$base/%s|%s|common\n" "$relpath" "$sysdir/common/$base/$relpath"
+                else
+                    # Check role overlays (reverse order so highest-priority role wins)
+                    found_role=""
+                    IFS=',' read -ra _rl <<< "$host_role"
+                    for _r in "${_rl[@]}"; do
+                        if [ -f "$sysdir/roles/$_r/$base/$relpath" ]; then
+                            found_role="$_r"
+                        fi
+                    done
+                    if [ -n "$found_role" ]; then
+                        printf "/$base/%s|%s|role:%s\n" "$relpath" "$sysdir/roles/$found_role/$base/$relpath" "$found_role"
+                    elif [ -f "$sysdir/common/$base/$relpath" ]; then
+                        printf "/$base/%s|%s|common\n" "$relpath" "$sysdir/common/$base/$relpath"
+                    fi
                 fi
             done
         fi
@@ -1390,20 +1254,88 @@ system-pull host *flags:
 
     printf "{{bold}}{{cyan}}hemma{{reset}} — system-pull from %s (%d managed files)\n\n" "$host_name" "$total"
 
-    # Phase 1: Pull all managed files from remote
+    # Phase 0.5: Load .hemma-secrets — files containing secrets that must NOT be auto-pulled
+    # Same format as .hemma-perms: relative paths, one per line, # comments allowed.
+    # Files listed here are skipped during pull to prevent secret leakage into git.
+    # To sync manually: ssh <host> 'sudo cat <path>' | redact secrets | write to overlay
+    secrets_list=$(mktemp)
+    for base in $base_paths; do
+        for secrets_src in "$sysdir/common/$base/.hemma-secrets" "$sysdir/$host_name/$base/.hemma-secrets"; do
+            if [ -f "$secrets_src" ]; then
+                while IFS= read -r line; do
+                    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+                    echo "/$base/$line" >> "$secrets_list"
+                done < "$secrets_src"
+            fi
+        done
+        # Check role overlays for .hemma-secrets
+        IFS=',' read -ra _rl <<< "$host_role"
+        for _r in "${_rl[@]}"; do
+            if [ -f "$sysdir/roles/$_r/$base/.hemma-secrets" ]; then
+                while IFS= read -r line; do
+                    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+                    echo "/$base/$line" >> "$secrets_list"
+                done < "$sysdir/roles/$_r/$base/.hemma-secrets"
+            fi
+        done
+    done
+    secrets_count=$(wc -l < "$secrets_list" | tr -d ' ')
+
+    # Phase 1: Pull all managed files from remote using sudo rsync
+    # (symmetric with system-apply which uses --rsync-path="sudo rsync")
+    # Build file list for rsync --files-from (excluding secret files)
+    pull_filelist=$(mktemp)
+    while IFS='|' read -r remote_path local_path source_label; do
+        # Skip files listed in .hemma-secrets
+        if grep -qxF "$remote_path" "$secrets_list" 2>/dev/null; then
+            continue
+        fi
+        echo "$remote_path" >> "$pull_filelist"
+    done < "$manifest"
+    # Single rsync call with sudo — pulls all managed files at once
+    rsync -e "ssh" --rsync-path="sudo rsync" -rltD --files-from="$pull_filelist" \
+        "$target_host:/" "$tmpdir/" 2>/dev/null || true
+    rm -f "$pull_filelist"
+
+    # Phase 1b: Diagnose missing files (distinguish "not found" from "permission denied")
+    # Only needed for files rsync couldn't pull
+    missing_diag=""
     while IFS='|' read -r remote_path local_path source_label; do
         pulled="$tmpdir$remote_path"
-        mkdir -p "$(dirname "$pulled")"
-        scp -q "$target_host:$remote_path" "$pulled" 2>/dev/null || true
+        if [ ! -f "$pulled" ]; then
+            # Ask remote: does the file exist at all?
+            file_status=$(ssh -o ConnectTimeout=5 "$target_host" \
+                "sudo test -f '$remote_path' && echo EXISTS || echo MISSING" 2>/dev/null || echo "UNKNOWN")
+            missing_diag="${missing_diag}${remote_path}|${file_status}\n"
+        fi
     done < "$manifest"
 
     # Phase 2: Compare and report
     drifted=0
+    secrets_skipped=0
     diff_log=$(mktemp)
     while IFS='|' read -r remote_path local_path source_label; do
+        # Check if this file is in the secrets list
+        if grep -qxF "$remote_path" "$secrets_list" 2>/dev/null; then
+            secrets_skipped=$((secrets_skipped + 1))
+            printf "  {{cyan}}secret{{reset}}  %s (skipped — listed in .hemma-secrets)\n" "$remote_path"
+            continue
+        fi
         pulled="$tmpdir$remote_path"
         if [ ! -f "$pulled" ]; then
-            printf "  {{yellow}}skip{{reset}}    %s (not found on remote)\n" "$remote_path"
+            # Use diagnosis from Phase 1b
+            diag=$(printf "%b" "$missing_diag" | grep "^${remote_path}|" | head -1 | cut -d'|' -f2 || true)
+            case "$diag" in
+                EXISTS)
+                    printf "  {{red}}error{{reset}}   %s (exists but rsync failed — check sudo/permissions)\n" "$remote_path"
+                    ;;
+                MISSING)
+                    printf "  {{yellow}}skip{{reset}}    %s (not found on remote)\n" "$remote_path"
+                    ;;
+                *)
+                    printf "  {{yellow}}skip{{reset}}    %s (could not determine status)\n" "$remote_path"
+                    ;;
+            esac
             continue
         fi
         if ! diff -q "$local_path" "$pulled" >/dev/null 2>&1; then
@@ -1411,12 +1343,7 @@ system-pull host *flags:
             printf "  {{yellow}}drifted{{reset}} %s (source: %s/)\n" "$remote_path" "$source_label"
             file_diff=$(diff -u "$local_path" "$pulled" 2>/dev/null | head -40 || true)
             { echo "=== $remote_path (overlay: $source_label/) ==="; echo "$file_diff"; echo ""; } >> "$diff_log"
-            # Use diff-so-fancy if available, otherwise plain diff
-            if command -v diff-so-fancy >/dev/null 2>&1; then
-                echo "$file_diff" | head -30 | diff-so-fancy 2>/dev/null || echo "$file_diff" | head -30
-            else
-                echo "$file_diff" | head -30
-            fi
+            echo "$file_diff" | head -30 | diff-so-fancy 2>/dev/null || echo "$file_diff" | head -30
             echo ""
         else
             printf "  {{green}}match{{reset}}   %s\n" "$remote_path"
@@ -1468,59 +1395,7 @@ system-pull host *flags:
         while read -r uf; do
             printf "    + %s\n" "$uf"
         done < "$unmanaged_files"
-
-        # Interactive add: offer to pull discovered files into the host overlay
-        if [ "$auto_yes" = "false" ]; then
-            printf "\n  Add discovered files to %s overlay? [y/N/s=select] " "$host_name"
-            read -r add_action
-        else
-            add_action="n"
-        fi
-
-        if [ "$add_action" = "y" ] || [ "$add_action" = "Y" ]; then
-            # Add all discovered files
-            added=0
-            while read -r uf; do
-                [ -z "$uf" ] && continue
-                # Determine which base path this belongs to (etc, usr, opt, Library)
-                base=$(echo "$uf" | cut -d'/' -f2)
-                relpath=$(echo "$uf" | sed "s|^/$base/||")
-                dest="$sysdir/$host_name/$base/$relpath"
-                mkdir -p "$(dirname "$dest")"
-                if scp -q "$target_host:$uf" "$dest" 2>/dev/null; then
-                    added=$((added + 1))
-                    printf "  {{green}}added{{reset}}  %s → %s/%s/\n" "$uf" "$host_name" "$base"
-                else
-                    printf "  {{red}}failed{{reset}} %s\n" "$uf"
-                fi
-            done < "$unmanaged_files"
-            if [ "$added" -gt 0 ]; then
-                printf "\n  {{green}}%d file(s) added to overlay.{{reset}}\n" "$added"
-            fi
-        elif [ "$add_action" = "s" ] || [ "$add_action" = "S" ]; then
-            # Selective add: prompt for each file
-            added=0
-            while read -r uf; do
-                [ -z "$uf" ] && continue
-                printf "  Add %s? [y/N] " "$uf"
-                read -r file_action
-                if [ "$file_action" = "y" ] || [ "$file_action" = "Y" ]; then
-                    base=$(echo "$uf" | cut -d'/' -f2)
-                    relpath=$(echo "$uf" | sed "s|^/$base/||")
-                    dest="$sysdir/$host_name/$base/$relpath"
-                    mkdir -p "$(dirname "$dest")"
-                    if scp -q "$target_host:$uf" "$dest" 2>/dev/null; then
-                        added=$((added + 1))
-                        printf "  {{green}}added{{reset}}  %s\n" "$uf"
-                    else
-                        printf "  {{red}}failed{{reset}} %s\n" "$uf"
-                    fi
-                fi
-            done < "$unmanaged_files"
-            if [ "$added" -gt 0 ]; then
-                printf "\n  {{green}}%d file(s) added to overlay.{{reset}}\n" "$added"
-            fi
-        fi
+        printf "  {{cyan}}tip{{reset}}      To add: scp %s:<path> %s/%s/<relative-path>\n" "$target_host" "$sysdir" "$host_name"
     fi
 
     rm -f "$unmanaged_files" "$managed_dirs"
@@ -1575,6 +1450,12 @@ system-pull host *flags:
         rm -f "$etckeeper_files"
     fi
 
+    # Note about secret files skipped
+    if [ "$secrets_skipped" -gt 0 ]; then
+        printf "\n  {{cyan}}note{{reset}}    %d file(s) skipped via .hemma-secrets (contain plaintext secrets)\n" "$secrets_skipped"
+        printf "  {{cyan}}tip{{reset}}      To sync manually: ssh %s 'sudo cat <path>' → redact → save to overlay\n" "$target_host"
+    fi
+
     # Note about encrypted secrets (not pullable)
     for base in $base_paths; do
         if [ -d "$sysdir/secrets/$host_name/$base" ]; then
@@ -1608,9 +1489,11 @@ system-pull host *flags:
         fi
     fi
 
-    # Phase 3: Update overlay with remote versions
+    # Phase 3: Update overlay with remote versions (skip secrets)
     updated=0
     while IFS='|' read -r remote_path local_path source_label; do
+        # Never auto-pull secret files into overlay
+        grep -qxF "$remote_path" "$secrets_list" 2>/dev/null && continue
         pulled="$tmpdir$remote_path"
         [ ! -f "$pulled" ] && continue
         if ! diff -q "$local_path" "$pulled" >/dev/null 2>&1; then
@@ -1625,7 +1508,7 @@ system-pull host *flags:
 
 # Prepare RPi SD card boot partition for headless first boot
 # Writes firstrun.sh (NetworkManager WiFi, user, hostname, SSH) + cmdline.txt trigger
-# Usage: just prepare-sd /Volumes/bootfs myrpi MyWiFi <wifi_password> [user]
+# Usage: just prepare-sd /Volumes/bootfs mypi MyWiFi <wifi_password> [user]
 prepare-sd bootfs hostname wifi_ssid wifi_password user="pi":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1644,10 +1527,10 @@ prepare-sd bootfs hostname wifi_ssid wifi_password user="pi":
 
     printf "{{cyan}}hemma{{reset}}: preparing SD card at %s\n" "$bootfs"
     printf "  hostname: %s\n  user:     %s (password: %s — change after first login)\n" "$hostname" "$user" "$hostname"
-    printf "  wifi:     %s\n\n" "$wifi_ssid"
+    printf "  wifi:     %s\n  country:  SE\n\n" "$wifi_ssid"
 
     # Use helper script to generate firstrun.sh (avoids Just heredoc escaping issues)
-    "{{hemma_dir}}/generate-firstrun.sh" "$bootfs/firstrun.sh" "$hostname" "$user" "$pass_hash" "$wifi_ssid" "$wifi_password"
+    "{{justfile_directory()}}/generate-firstrun.sh" "$bootfs/firstrun.sh" "$hostname" "$user" "$pass_hash" "$wifi_ssid" "$wifi_password"
     chmod +x "$bootfs/firstrun.sh"
     printf "  {{green}}✓{{reset}} firstrun.sh written\n"
 
@@ -1656,7 +1539,7 @@ prepare-sd bootfs hostname wifi_ssid wifi_password user="pi":
 
     current_cmdline=$(cat "$bootfs/cmdline.txt")
     clean_cmdline=$(echo "$current_cmdline" | sed 's| systemd.run=[^ ]* systemd.run_success_action=[^ ]* systemd.unit=[^ ]*||g' | sed 's| cfg80211.ieee80211_regdom=[^ ]*||g')
-    printf '%s' "${clean_cmdline} systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target" > "$bootfs/cmdline.txt"
+    printf '%s' "${clean_cmdline} cfg80211.ieee80211_regdom=SE systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target" > "$bootfs/cmdline.txt"
     printf "  {{green}}✓{{reset}} cmdline.txt updated\n"
 
     removed=0
