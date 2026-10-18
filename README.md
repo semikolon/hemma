@@ -58,7 +58,7 @@ hemma system-diff server  # Preview system config changes
 
 | Command | Description |
 |---------|-------------|
-| `hemma status` | Show fleet status — last nit sync, git hash, uptime |
+| `hemma status` | Show fleet status — last `nit update` result, git hash, uptime |
 | `hemma apply <host>` | Sync dotfiles + system overlay to a host |
 | `hemma apply-all` | Sync to all non-critical hosts (parallel) |
 | `hemma apply-all --force` | Include critical hosts |
